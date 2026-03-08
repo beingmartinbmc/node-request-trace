@@ -12,8 +12,12 @@ Request tracing and performance visualization library for Node.js. Inspect the f
 
 - **Request Tracing** — Full lifecycle tracking with async context propagation via `AsyncLocalStorage`
 - **Step Tracking** — Manual instrumentation for DB calls, service calls, async operations
+- **Automatic Middleware Instrumentation** — Auto-capture middleware timing for Express, Fastify lifecycle phases, and Koa
+- **HTTP Client Tracing** — Auto-instrument outgoing `http`, `https`, and `fetch` requests
 - **Framework Support** — Express.js, Fastify, and Koa
-- **UI Dashboard** — Built-in real-time visualization at `/trace/ui`
+- **UI Dashboard** — Built-in real-time visualization at `/trace/ui` with Waterfall, Timeline, and Flamegraph views
+- **CLI Tool** — Inspect traces from the terminal with `npx node-request-trace`
+- **Chrome Trace Export** — Export traces to `chrome://tracing` format for performance engineers
 - **HTTP API** — JSON endpoints for trace retrieval and statistics
 - **Slow Request Detection** — Configurable threshold with automatic flagging
 - **Sampling** — Configurable rate to reduce overhead in production
@@ -26,11 +30,10 @@ Request tracing and performance visualization library for Node.js. Inspect the f
 
 The library has three core components:
 
-```mermaid
-graph LR
-  A["<b>Trace Engine</b><br/>AsyncLocalStorage context<br/>+ step tracking"] --> B["<b>Trace Storage</b><br/>In-memory store<br/>with eviction & retention"]
-  B --> C["<b>UI Dashboard</b><br/>Real-time visualization<br/>at /trace/ui"]
-```
+| Trace Engine | → | Trace Storage | → | UI Dashboard |
+|:---:|:---:|:---:|:---:|:---:|
+| AsyncLocalStorage context | | In-memory store | | Real-time visualization |
+| + step tracking | | with eviction & retention | | at `/trace/ui` |
 
 ## Installation
 
@@ -139,7 +142,8 @@ trace.init({
   samplingRate: 1,          // 0-1 — fraction of requests to trace (0.1 = 10%)
   maxTraces: 1000,          // max traces kept in memory
   retentionSeconds: 300,    // auto-evict traces older than this (seconds)
-  autoTrack: false,         // auto-track Express middleware execution times
+  autoTrack: false,         // auto-track middleware execution times
+  traceOutgoing: false,     // auto-trace outgoing http/https/fetch requests
   sensitiveHeaders: null,   // custom list of headers to redact (string[])
 });
 ```
@@ -150,7 +154,8 @@ trace.init({
 | `samplingRate` | `1` | Fraction of requests to trace (`1` = 100%, `0.1` = 10%) |
 | `maxTraces` | `1000` | Maximum traces held in memory; oldest evicted when full |
 | `retentionSeconds` | `300` | Traces older than this are automatically evicted |
-| `autoTrack` | `false` | Automatically track Express middleware execution times |
+| `autoTrack` | `false` | Auto-instrument middleware for Express, Fastify lifecycle, Koa |
+| `traceOutgoing` | `false` | Auto-trace outgoing `http`, `https`, and `fetch` requests |
 | `sensitiveHeaders` | `null` | Custom array of header names to redact (overrides defaults) |
 
 ## API Reference
@@ -201,13 +206,44 @@ Returns the current request trace object, or `null` if called outside a traced r
 
 Attach a logger for trace output. Returns `this` for chaining.
 
+### `trace.instrumentKoa(app)`
+
+Patches `app.use()` on a Koa instance to automatically wrap each middleware with timing. Requires `autoTrack: true`.
+
+```js
+const app = new Koa();
+trace.instrumentKoa(app); // patches app.use()
+app.use(authMiddleware);   // automatically timed
+app.use(validateInput);    // automatically timed
+```
+
+### `trace.enableHttpTracing()`
+
+Manually enable outgoing HTTP client tracing. Monkey-patches `http.request`, `http.get`, `https.request`, `https.get`, and `globalThis.fetch`. Alternatively, set `traceOutgoing: true` in `init()`.
+
+### `trace.disableHttpTracing()`
+
+Restore original HTTP functions and stop tracing outgoing requests.
+
+### `trace.isHttpTracingEnabled()`
+
+Returns `true` if outgoing HTTP tracing is currently active.
+
+### `trace.exportChromeTrace(trace)`
+
+Convert a trace object to [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU). Returns a `{ traceEvents: [...] }` object.
+
+### `trace.exportChromeTraceJson(trace)`
+
+Same as above but returns a JSON string ready for file export.
+
 ### `trace.sanitizeHeaders(headers)`
 
 Returns a copy of headers with sensitive values replaced by `[REDACTED]`.
 
 ### `trace.destroy()`
 
-Clean up storage intervals and clear all stored traces.
+Clean up storage intervals, clear all stored traces, and disable HTTP tracing.
 
 ## HTTP Endpoints
 
@@ -220,6 +256,7 @@ Mount with `app.use(trace.routes())` to enable these endpoints:
 | `GET /trace/slow` | Traces exceeding `slowThreshold` |
 | `GET /trace/stats` | Aggregate statistics |
 | `GET /trace/:requestId` | Single trace by request ID |
+| `GET /trace/:requestId/chrome` | Chrome Trace Event Format export |
 
 ### Example: `/trace/stats` response
 
@@ -263,9 +300,11 @@ Accessible at `/trace/ui`. The dashboard provides:
 ### Recent Requests Table
 Sortable table showing request ID, method, path, duration, status, and timestamp. Click any row to view the full trace detail.
 
-### Request Timeline Visualization
-Each request displays a waterfall timeline of its steps:
+### Request Detail with View Modes
 
+Click any request to see its full detail with three visualization modes:
+
+**Waterfall** — Bars proportional to step duration (default):
 ```
 authMiddleware  |████|                              12ms
 validateInput   |██|                                 5ms
@@ -273,6 +312,25 @@ dbQuery         |█████████████████████
 paymentService  |██████████|                        45ms
 responseRender  |████████|                          30ms
 ```
+
+**Timeline** — Time-proportional positioning showing when each step started and how long it ran:
+```
+|-------------- request 340ms ----------------|
+auth        |██|
+validation    |█|
+dbQuery         |████████████████████████|
+payment                                   |████|
+render                                          |██|
+0ms                                          340ms
+```
+
+**Flamegraph** — Compact stacked view showing step durations as proportional blocks:
+```
+[auth][val][      dbQuery        ][payment][render]
+0ms                                           340ms
+```
+
+Each detail view also includes a **⬇ Chrome Trace** export button.
 
 ### Slow Requests View
 Filtered view showing only requests exceeding the configured `slowThreshold`.
@@ -385,6 +443,139 @@ app.use(async (ctx) => {
 
 app.listen(3000);
 ```
+
+## Automatic Middleware Instrumentation
+
+Enable `autoTrack: true` to automatically capture middleware timing without manual `trace.step()` calls.
+
+### Express
+
+Express middleware layers are automatically wrapped to record each middleware's execution time:
+
+```js
+trace.init({ autoTrack: true });
+app.use(trace.middleware());
+```
+
+Example trace output:
+```
+authMiddleware: 12ms
+validateInput: 5ms
+handler: 210ms
+```
+
+### Fastify
+
+Fastify lifecycle phases are automatically timed:
+
+```js
+trace.init({ autoTrack: true });
+fastify.register(trace.fastifyPlugin());
+```
+
+Records: `onRequest`, `preParsing`, `preValidation`, `handler`, `onSend` — each as a step with `type: "lifecycle"`.
+
+### Koa
+
+Patch the Koa app to wrap each `app.use()` call with timing:
+
+```js
+trace.init({ autoTrack: true });
+const app = new Koa();
+trace.instrumentKoa(app);
+
+app.use(authMiddleware);   // auto-timed as "authMiddleware"
+app.use(validateInput);    // auto-timed as "validateInput"
+app.use(trace.koaMiddleware());
+```
+
+Each middleware is recorded as a step with `type: "middleware"`.
+
+## HTTP Client Tracing
+
+Automatically capture outgoing HTTP requests as trace steps:
+
+```js
+trace.init({ traceOutgoing: true });
+```
+
+Or enable/disable manually:
+
+```js
+trace.enableHttpTracing();
+// ... make requests ...
+trace.disableHttpTracing();
+```
+
+Instruments `http.request`, `http.get`, `https.request`, `https.get`, and `globalThis.fetch` (Node 18+).
+
+Example trace with outgoing calls:
+```
+GET /checkout
+├─ dbQuery                    210ms
+├─ HTTP POST stripe.com/v1    180ms  [http-outgoing]
+├─ redis.get                   5ms
+└─ HTTP GET cdn.example.com    45ms  [http-outgoing]
+```
+
+Outgoing steps are recorded with `type: "http-outgoing"` and include the method, host, and path.
+
+## CLI Tool
+
+Inspect traces from the terminal without the UI dashboard:
+
+```bash
+# Show aggregate statistics
+npx node-request-trace stats http://localhost:3000
+
+# List recent traces
+npx node-request-trace recent http://localhost:3000
+
+# List slow traces
+npx node-request-trace slow http://localhost:3000
+
+# Inspect a single trace with timeline + flamegraph
+npx node-request-trace inspect http://localhost:3000 req_a1b2c3d4
+
+# Live tail incoming requests
+npx node-request-trace tail http://localhost:3000
+
+# Export trace as Chrome Trace Event JSON
+npx node-request-trace export http://localhost:3000 req_a1b2c3d4 > trace.json
+```
+
+The CLI uses ANSI colors and renders waterfall bars, flamegraph blocks, and formatted tables directly in the terminal.
+
+## Chrome Trace Export
+
+Export any trace in [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU) for analysis in `chrome://tracing` or other performance tools.
+
+### Via HTTP endpoint
+
+```bash
+curl http://localhost:3000/trace/req_a1b2c3d4/chrome > trace.json
+```
+
+### Via API
+
+```js
+const traceData = tracer.storage.get("req_a1b2c3d4");
+const chromeTrace = trace.exportChromeTrace(traceData);
+// or as JSON string
+const json = trace.exportChromeTraceJson(traceData);
+```
+
+### Via Dashboard
+
+Click the **⬇ Chrome Trace** button in any trace detail view to download the file.
+
+### Via CLI
+
+```bash
+npx node-request-trace export http://localhost:3000 req_a1b2c3d4 > trace.json
+```
+
+Open the exported file in `chrome://tracing` to see a full timeline visualization with request and step events on separate threads.
 
 ## Logging Integration
 

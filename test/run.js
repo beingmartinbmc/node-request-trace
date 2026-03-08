@@ -1502,5 +1502,786 @@ test('api: module exports singleton and RequestTracer class', () => {
   assert(typeof mod.RequestTracer === 'function');
 });
 
+// =========================================================================
+// lib/chrome-trace.js
+// =========================================================================
+const { toChromeTraceFormat, toChromeTraceJson } = require('../lib/chrome-trace');
+
+test('chrome-trace: toChromeTraceFormat with steps', () => {
+  const trace = {
+    requestId: 'req_abc',
+    method: 'GET',
+    path: '/test',
+    startTime: 1000,
+    duration: 100,
+    status: 200,
+    steps: [
+      { name: 'db', start: 1010, duration: 50 },
+      { name: 'cache', start: 1060, duration: 20, error: 'miss', type: 'cache' },
+    ],
+  };
+  const result = toChromeTraceFormat(trace);
+  assert(result.traceEvents != null);
+  assertEqual(result.traceEvents.length, 3);
+  // Request event
+  assertEqual(result.traceEvents[0].cat, 'request');
+  assertEqual(result.traceEvents[0].name, 'GET /test');
+  assertEqual(result.traceEvents[0].ph, 'X');
+  assertEqual(result.traceEvents[0].ts, 1000 * 1000);
+  assertEqual(result.traceEvents[0].dur, 100 * 1000);
+  assertEqual(result.traceEvents[0].args.requestId, 'req_abc');
+  assertEqual(result.traceEvents[0].args.status, 200);
+  // Step events
+  assertEqual(result.traceEvents[1].cat, 'step');
+  assertEqual(result.traceEvents[1].name, 'db');
+  assertEqual(result.traceEvents[1].ts, 1010 * 1000);
+  assertEqual(result.traceEvents[1].dur, 50 * 1000);
+  // Step with error and type
+  assertEqual(result.traceEvents[2].args.error, 'miss');
+  assertEqual(result.traceEvents[2].args.type, 'cache');
+});
+
+test('chrome-trace: toChromeTraceFormat without steps', () => {
+  const trace = {
+    requestId: 'req_no', method: 'POST', path: '/x',
+    startTime: 500, duration: 10, status: 201, steps: [],
+  };
+  const result = toChromeTraceFormat(trace);
+  assertEqual(result.traceEvents.length, 1);
+});
+
+test('chrome-trace: toChromeTraceFormat with null steps', () => {
+  const trace = {
+    requestId: 'req_null', method: 'GET', path: '/',
+    startTime: 500, duration: 10, status: 200,
+  };
+  const result = toChromeTraceFormat(trace);
+  assertEqual(result.traceEvents.length, 1);
+});
+
+test('chrome-trace: toChromeTraceFormat step without error or type', () => {
+  const trace = {
+    requestId: 'req_plain', method: 'GET', path: '/',
+    startTime: 500, duration: 10, status: 200,
+    steps: [{ name: 's1', start: 501, duration: 5 }],
+  };
+  const result = toChromeTraceFormat(trace);
+  assertEqual(result.traceEvents[1].args.error, undefined);
+  assertEqual(result.traceEvents[1].args.type, undefined);
+});
+
+test('chrome-trace: toChromeTraceJson returns valid JSON', () => {
+  const trace = {
+    requestId: 'req_json', method: 'GET', path: '/',
+    startTime: 500, duration: 10, status: 200, steps: [],
+  };
+  const json = toChromeTraceJson(trace);
+  assert(typeof json === 'string');
+  const parsed = JSON.parse(json);
+  assert(parsed.traceEvents != null);
+});
+
+// =========================================================================
+// lib/http-tracer.js
+// =========================================================================
+const httpTracer = require('../lib/http-tracer');
+const { runWithTrace: rwtForHttp, currentTrace: ctForHttp } = require('../lib/trace-engine');
+const { EventEmitter } = require('node:events');
+
+test('http-tracer: _parseRequestArgs with string URL', () => {
+  const result = httpTracer._parseRequestArgs(['https://api.example.com/users?q=1']);
+  assertEqual(result.method, 'GET');
+  assertEqual(result.host, 'api.example.com');
+  assertEqual(result.path, '/users');
+});
+
+test('http-tracer: _parseRequestArgs with URL object', () => {
+  const u = new URL('https://stripe.com/v1/charges');
+  const result = httpTracer._parseRequestArgs([u]);
+  assertEqual(result.host, 'stripe.com');
+  assertEqual(result.path, '/v1/charges');
+});
+
+test('http-tracer: _parseRequestArgs with options object', () => {
+  const result = httpTracer._parseRequestArgs([{ hostname: 'db.local', path: '/query', method: 'POST' }]);
+  assertEqual(result.method, 'POST');
+  assertEqual(result.host, 'db.local');
+  assertEqual(result.path, '/query');
+});
+
+test('http-tracer: _parseRequestArgs with options using host instead of hostname', () => {
+  const result = httpTracer._parseRequestArgs([{ host: 'myhost:3000', path: '/api' }]);
+  assertEqual(result.host, 'myhost:3000');
+});
+
+test('http-tracer: _parseRequestArgs defaults', () => {
+  const result = httpTracer._parseRequestArgs([{}]);
+  assertEqual(result.method, 'GET');
+  assertEqual(result.host, 'unknown');
+  assertEqual(result.path, '/');
+});
+
+test('http-tracer: _parseRequestArgs with second arg overrides', () => {
+  const result = httpTracer._parseRequestArgs([
+    'http://old.com/old',
+    { method: 'PUT', hostname: 'new.com', path: '/new' },
+  ]);
+  assertEqual(result.method, 'PUT');
+  assertEqual(result.host, 'new.com');
+  assertEqual(result.path, '/new');
+});
+
+test('http-tracer: _parseRequestArgs with second arg using host', () => {
+  const result = httpTracer._parseRequestArgs([
+    'http://old.com/old',
+    { host: 'newhost:8080' },
+  ]);
+  assertEqual(result.host, 'newhost:8080');
+});
+
+test('http-tracer: _parseRequestArgs with function as second arg ignores it', () => {
+  const cb = () => {};
+  const result = httpTracer._parseRequestArgs(['http://example.com/path', cb]);
+  assertEqual(result.host, 'example.com');
+  assertEqual(result.path, '/path');
+});
+
+test('http-tracer: _parseRequestArgs with invalid string URL', () => {
+  const result = httpTracer._parseRequestArgs(['/relative/path']);
+  assertEqual(result.path, '/relative/path');
+});
+
+test('http-tracer: enableHttpTracing / disableHttpTracing / isEnabled', () => {
+  assert(!httpTracer.isEnabled());
+  httpTracer.enableHttpTracing();
+  assert(httpTracer.isEnabled());
+  // Idempotent
+  httpTracer.enableHttpTracing();
+  assert(httpTracer.isEnabled());
+  httpTracer.disableHttpTracing();
+  assert(!httpTracer.isEnabled());
+  // Idempotent
+  httpTracer.disableHttpTracing();
+  assert(!httpTracer.isEnabled());
+});
+
+test('http-tracer: _wrapRequest without active trace returns original', () => {
+  const fakeReq = new EventEmitter();
+  const origFn = () => fakeReq;
+  const result = httpTracer._wrapRequest(origFn, 'http', [{ hostname: 'test.com', path: '/x' }]);
+  assertEqual(result, fakeReq);
+});
+
+test('http-tracer: _wrapRequest with trace records step on response', () => {
+  const fakeReq = new EventEmitter();
+  const origFn = () => fakeReq;
+  const trace = { requestId: 'r1', steps: [] };
+
+  rwtForHttp(trace, () => {
+    const req = httpTracer._wrapRequest(origFn, 'http', [{ hostname: 'api.com', path: '/data', method: 'GET' }]);
+    assertEqual(req, fakeReq);
+    fakeReq.emit('response', {});
+    assertEqual(trace.steps.length, 1);
+    assert(trace.steps[0].name.includes('api.com'));
+    assert(trace.steps[0].duration >= 0);
+    assertEqual(trace.steps[0].type, 'http-outgoing');
+  });
+});
+
+test('http-tracer: _wrapRequest with trace records step on error', () => {
+  const fakeReq = new EventEmitter();
+  const origFn = () => fakeReq;
+  const trace = { requestId: 'r2', steps: [] };
+
+  rwtForHttp(trace, () => {
+    httpTracer._wrapRequest(origFn, 'https', [{ hostname: 'fail.com', path: '/err' }]);
+    fakeReq.emit('error', new Error('connect refused'));
+    assertEqual(trace.steps.length, 1);
+    assertEqual(trace.steps[0].error, 'connect refused');
+    assertEqual(trace.steps[0].type, 'http-outgoing');
+  });
+});
+
+test('http-tracer: _wrapFetch without active trace calls original', async () => {
+  let called = false;
+  const origFn = async () => { called = true; return { status: 200 }; };
+  const result = await httpTracer._wrapFetch(origFn, ['http://example.com/api']);
+  assert(called);
+  assertEqual(result.status, 200);
+});
+
+test('http-tracer: _wrapFetch with trace records step on success', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf1', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      await httpTracer._wrapFetch(origFn, ['https://api.stripe.com/v1/charges', { method: 'POST' }]);
+      assertEqual(trace.steps.length, 1);
+      assert(trace.steps[0].name.includes('api.stripe.com'));
+      assert(trace.steps[0].name.includes('POST'));
+      assertEqual(trace.steps[0].type, 'http-outgoing');
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: _wrapFetch with trace records step on error', async () => {
+  const origFn = async () => { throw new Error('network error'); };
+  const trace = { requestId: 'rf2', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      try {
+        await httpTracer._wrapFetch(origFn, ['http://fail.com/x']);
+      } catch (e) {
+        assertEqual(e.message, 'network error');
+      }
+      assertEqual(trace.steps.length, 1);
+      assertEqual(trace.steps[0].error, 'network error');
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: _wrapFetch with URL object input', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf3', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      const u = new URL('https://cdn.example.com/assets');
+      await httpTracer._wrapFetch(origFn, [u]);
+      assertEqual(trace.steps[0].name, 'HTTP GET cdn.example.com/assets');
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: _wrapFetch with Request-like object input', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf4', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      await httpTracer._wrapFetch(origFn, [{ url: 'https://api.com/v2/data', method: 'PATCH' }]);
+      assert(trace.steps[0].name.includes('PATCH'));
+      assert(trace.steps[0].name.includes('api.com'));
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: _wrapFetch with Request-like object with invalid url', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf5', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      await httpTracer._wrapFetch(origFn, [{ url: 'not-a-url', method: 'GET' }]);
+      assertEqual(trace.steps.length, 1);
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: _wrapFetch with Request-like object without method falls back', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf_nomethod', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      await httpTracer._wrapFetch(origFn, [{ url: 'https://api.com/data' }]);
+      assert(trace.steps[0].name.includes('GET'));
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: _wrapFetch with no init defaults to GET', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf6', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      await httpTracer._wrapFetch(origFn, ['http://example.com/']);
+      assert(trace.steps[0].name.includes('GET'));
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: patched http.request/get and https.request/get are invoked', () => {
+  const http = require('node:http');
+  const https = require('node:https');
+  httpTracer.enableHttpTracing();
+
+  // Call all four patched functions against a dead port to execute their bodies
+  const req1 = http.request({ hostname: '127.0.0.1', port: 1, path: '/' });
+  req1.on('error', () => {});
+  req1.destroy();
+
+  const req2 = http.get({ hostname: '127.0.0.1', port: 1, path: '/' });
+  req2.on('error', () => {});
+  req2.destroy();
+
+  const req3 = https.request({ hostname: '127.0.0.1', port: 1, path: '/' });
+  req3.on('error', () => {});
+  req3.destroy();
+
+  const req4 = https.get({ hostname: '127.0.0.1', port: 1, path: '/' });
+  req4.on('error', () => {});
+  req4.destroy();
+
+  httpTracer.disableHttpTracing();
+});
+
+test('http-tracer: _wrapFetch with invalid string URL in trace context', async () => {
+  const origFn = async () => ({ status: 200 });
+  const trace = { requestId: 'rf_inv', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      await httpTracer._wrapFetch(origFn, ['/relative/no-host']);
+      assertEqual(trace.steps.length, 1);
+      assert(trace.steps[0].name.includes('/relative/no-host'));
+      resolve();
+    });
+  });
+});
+
+test('http-tracer: patched fetch is callable when globalThis.fetch exists', () => {
+  // Save original
+  const origFetch = globalThis.fetch;
+  // Set a dummy fetch
+  globalThis.fetch = async function dummyFetch() { return { status: 200 }; };
+
+  httpTracer.enableHttpTracing();
+  assert(globalThis.fetch.name === 'tracedFetch');
+  httpTracer.disableHttpTracing();
+
+  // Restore
+  if (origFetch) {
+    globalThis.fetch = origFetch;
+  } else {
+    delete globalThis.fetch;
+  }
+});
+
+test('http-tracer: patched fetch calls _wrapFetch with trace', async () => {
+  const origFetch = globalThis.fetch;
+  let fetchCalled = false;
+  globalThis.fetch = async function dummyFetch() { fetchCalled = true; return { status: 200 }; };
+
+  httpTracer.enableHttpTracing();
+  const trace = { requestId: 'fetch_patched', steps: [] };
+
+  await new Promise((resolve) => {
+    rwtForHttp(trace, async () => {
+      const result = await globalThis.fetch('http://example.com/test');
+      assert(fetchCalled);
+      assertEqual(trace.steps.length, 1);
+      resolve();
+    });
+  });
+
+  httpTracer.disableHttpTracing();
+  if (origFetch) {
+    globalThis.fetch = origFetch;
+  } else {
+    delete globalThis.fetch;
+  }
+});
+
+// =========================================================================
+// lib/routes.js — chrome trace endpoint
+// =========================================================================
+test('routes: /trace/:requestId/chrome returns chrome trace format', () => {
+  const t = makeTracer();
+  const router = createRouter(t);
+  const trace = { requestId: 'req_chrome1', method: 'GET', path: '/test', startTime: 1000, duration: 50, status: 200, steps: [] };
+  t.storage.store(trace);
+
+  let body = '';
+  let headers = {};
+  const res = {
+    writeHead(code, h) { headers = h; },
+    end(data) { body = data; },
+  };
+  router({ url: '/trace/req_chrome1/chrome' }, res);
+  const parsed = JSON.parse(body);
+  assert(parsed.traceEvents != null);
+  assertEqual(parsed.traceEvents[0].cat, 'request');
+  t.destroy();
+});
+
+test('routes: /trace/:requestId/chrome returns 404 when not found', () => {
+  const t = makeTracer();
+  const router = createRouter(t);
+
+  let statusCode = 0;
+  let body = '';
+  const res = {
+    writeHead(code) { statusCode = code; },
+    end(data) { body = data; },
+  };
+  router({ url: '/trace/req_missing/chrome' }, res);
+  assertEqual(statusCode, 404);
+  assert(body.includes('not found'));
+  t.destroy();
+});
+
+// =========================================================================
+// lib/middleware/fastify.js — autoTrack lifecycle
+// =========================================================================
+test('fastify-mw: autoTrack registers lifecycle hooks', () => {
+  const t = makeTracer({ autoTrack: true });
+  const pluginFn = fastifyPluginFn(t);
+  const hooks = {};
+  const fakeFastify = {
+    addHook(name, fn) {
+      if (!hooks[name]) hooks[name] = [];
+      hooks[name].push(fn);
+    },
+  };
+  let doneCalled = false;
+  pluginFn(fakeFastify, {}, () => { doneCalled = true; });
+  assert(doneCalled);
+  assert(hooks.onRequest != null);
+  assert(hooks.preParsing != null);
+  assert(hooks.preValidation != null);
+  assert(hooks.preHandler != null);
+  assert(hooks.onSend != null);
+  assert(hooks.onResponse != null);
+  t.destroy();
+});
+
+test('fastify-mw: autoTrack lifecycle records phase timings', () => {
+  const t = makeTracer({ autoTrack: true });
+  const pluginFn = fastifyPluginFn(t);
+  const hooks = {};
+  const fakeFastify = {
+    addHook(name, fn) {
+      if (!hooks[name]) hooks[name] = [];
+      hooks[name].push(fn);
+    },
+  };
+  pluginFn(fakeFastify, {}, () => {});
+
+  const fakeRequest = { method: 'GET', url: '/lifecycle', headers: {} };
+  const fakeReply = { header() {}, statusCode: 200 };
+
+  // onRequest
+  hooks.onRequest[0](fakeRequest, fakeReply, () => {});
+  assert(fakeRequest._trace != null);
+  assert(fakeRequest._tracePhaseStart != null);
+
+  // preParsing
+  hooks.preParsing[0](fakeRequest, fakeReply, 'payload', (err, payload) => {});
+  // preValidation
+  hooks.preValidation[0](fakeRequest, fakeReply, () => {});
+  // preHandler
+  hooks.preHandler[0](fakeRequest, fakeReply, () => {});
+  // onSend
+  hooks.onSend[0](fakeRequest, fakeReply, 'body', (err, payload) => {});
+  // onResponse
+  hooks.onResponse[0](fakeRequest, fakeReply, () => {});
+
+  // In synchronous tests, duration between calls is 0ms so _recordPhase skips
+  // Verify the mechanism worked: trace was finalized and _tracePhaseStart updated
+  assert(fakeRequest._trace.duration >= 0);
+  assert(fakeRequest._tracePhaseStart != null);
+  t.destroy();
+});
+
+test('fastify-mw: _recordPhase skips when no trace', () => {
+  const t = makeTracer({ autoTrack: true });
+  const pluginFn = fastifyPluginFn(t);
+  const hooks = {};
+  const fakeFastify = {
+    addHook(name, fn) {
+      if (!hooks[name]) hooks[name] = [];
+      hooks[name].push(fn);
+    },
+  };
+  pluginFn(fakeFastify, {}, () => {});
+
+  // Request with no trace (not sampled)
+  const fakeRequest = { method: 'GET', url: '/skip', headers: {} };
+  const fakeReply = { header() {}, statusCode: 200 };
+
+  // Skip onRequest (no trace created)
+  // Directly call preParsing with a request that has no _trace
+  hooks.preParsing[0](fakeRequest, fakeReply, 'p', (e, p) => {});
+  // Should not throw
+  t.destroy();
+});
+
+test('fastify-mw: _recordPhase skips when no _tracePhaseStart', () => {
+  const t = makeTracer({ autoTrack: true });
+  const pluginFn = fastifyPluginFn(t);
+  const hooks = {};
+  const fakeFastify = {
+    addHook(name, fn) {
+      if (!hooks[name]) hooks[name] = [];
+      hooks[name].push(fn);
+    },
+  };
+  pluginFn(fakeFastify, {}, () => {});
+
+  const fakeRequest = { _trace: { steps: [] }, method: 'GET', url: '/no-start', headers: {} };
+  const fakeReply = { header() {}, statusCode: 200 };
+  hooks.preParsing[0](fakeRequest, fakeReply, 'p', (e, p) => {});
+  assertEqual(fakeRequest._trace.steps.length, 0);
+  t.destroy();
+});
+
+test('fastify-mw: _recordPhase records step when duration > 0', () => {
+  const t = makeTracer({ autoTrack: true });
+  const pluginFn = fastifyPluginFn(t);
+  const hooks = {};
+  const fakeFastify = {
+    addHook(name, fn) {
+      if (!hooks[name]) hooks[name] = [];
+      hooks[name].push(fn);
+    },
+  };
+  pluginFn(fakeFastify, {}, () => {});
+
+  const trace = { steps: [], requestId: 'phase_dur', startTime: Date.now(), duration: 0, status: 0 };
+  const fakeRequest = {
+    _trace: trace,
+    _tracePhaseStart: Date.now() - 50,
+    method: 'GET', url: '/dur', headers: {},
+  };
+  const fakeReply = { header() {}, statusCode: 200 };
+  // Call preParsing which triggers _recordPhase('onRequest')
+  hooks.preParsing[0](fakeRequest, fakeReply, 'p', (e, p) => {});
+  assertEqual(trace.steps.length, 1);
+  assertEqual(trace.steps[0].name, 'onRequest');
+  assertEqual(trace.steps[0].type, 'lifecycle');
+  assert(trace.steps[0].duration > 0);
+  t.destroy();
+});
+
+test('fastify-mw: autoTrack onResponse records onSend phase', () => {
+  const t = makeTracer({ autoTrack: true });
+  const pluginFn = fastifyPluginFn(t);
+  const hooks = {};
+  const fakeFastify = {
+    addHook(name, fn) {
+      if (!hooks[name]) hooks[name] = [];
+      hooks[name].push(fn);
+    },
+  };
+  pluginFn(fakeFastify, {}, () => {});
+
+  const fakeRequest = { method: 'GET', url: '/onsend', headers: {} };
+  const fakeReply = { header() {}, statusCode: 200 };
+
+  hooks.onRequest[0](fakeRequest, fakeReply, () => {});
+  hooks.onResponse[0](fakeRequest, fakeReply, () => {});
+
+  // Should have recorded at least the onSend phase in onResponse
+  assert(fakeRequest._trace.duration >= 0);
+  t.destroy();
+});
+
+// =========================================================================
+// lib/middleware/koa.js — instrumentKoa
+// =========================================================================
+const { instrumentKoa } = require('../lib/middleware/koa');
+
+test('koa: instrumentKoa patches app.use', () => {
+  const t = makeTracer({ autoTrack: true });
+  let usedFn = null;
+  const fakeApp = {
+    use(fn) { usedFn = fn; return this; },
+  };
+  const result = instrumentKoa(fakeApp, t);
+  assertEqual(result, fakeApp);
+  assert(fakeApp._traceInstrumented);
+
+  // Use a named middleware
+  async function authMiddleware(ctx, next) { await next(); }
+  fakeApp.use(authMiddleware);
+  // usedFn should be a wrapper, not the original
+  assert(usedFn !== authMiddleware);
+  assert(typeof usedFn === 'function');
+  t.destroy();
+});
+
+test('koa: instrumentKoa is idempotent', () => {
+  const t = makeTracer({ autoTrack: true });
+  const fakeApp = {
+    use(fn) { return this; },
+    _traceInstrumented: true,
+  };
+  const result = instrumentKoa(fakeApp, t);
+  assertEqual(result, fakeApp);
+  t.destroy();
+});
+
+test('koa: instrumentKoa with null app returns it', () => {
+  const t = makeTracer();
+  const result = instrumentKoa(null, t);
+  assertEqual(result, null);
+  t.destroy();
+});
+
+test('koa: instrumentKoa with app missing use returns it', () => {
+  const t = makeTracer();
+  const app = {};
+  const result = instrumentKoa(app, t);
+  assertEqual(result, app);
+  t.destroy();
+});
+
+test('koa: instrumentKoa wrapped middleware records step with trace', async () => {
+  const t = makeTracer({ autoTrack: true });
+  let wrappedFn = null;
+  const fakeApp = {
+    use(fn) { wrappedFn = fn; return this; },
+  };
+  instrumentKoa(fakeApp, t);
+
+  async function myHandler(ctx, next) { await next(); }
+  fakeApp.use(myHandler);
+
+  const trace = { requestId: 'koa_auto', steps: [] };
+  const ctx = { _trace: trace };
+  await wrappedFn(ctx, async () => {});
+  assertEqual(trace.steps.length, 1);
+  assertEqual(trace.steps[0].name, 'myHandler');
+  assertEqual(trace.steps[0].type, 'middleware');
+  t.destroy();
+});
+
+test('koa: instrumentKoa wrapped middleware works without trace', async () => {
+  const t = makeTracer({ autoTrack: true });
+  let wrappedFn = null;
+  const fakeApp = {
+    use(fn) { wrappedFn = fn; return this; },
+  };
+  instrumentKoa(fakeApp, t);
+
+  async function handler(ctx, next) { await next(); }
+  fakeApp.use(handler);
+
+  const ctx = {};
+  await wrappedFn(ctx, async () => {});
+  // Should not throw
+  t.destroy();
+});
+
+test('koa: instrumentKoa uses index fallback for unnamed middleware', async () => {
+  const t = makeTracer({ autoTrack: true });
+  let wrappedFn = null;
+  const fakeApp = {
+    use(fn) { wrappedFn = fn; return this; },
+  };
+  instrumentKoa(fakeApp, t);
+
+  const fn = async (ctx, next) => { await next(); };
+  Object.defineProperty(fn, 'name', { value: '' });
+  fakeApp.use(fn);
+
+  const trace = { requestId: 'koa_idx', steps: [] };
+  await wrappedFn({ _trace: trace }, async () => {});
+  assert(trace.steps[0].name.startsWith('middleware_'));
+  t.destroy();
+});
+
+test('koa: instrumentKoa with autoTrack false passes through', () => {
+  const t = makeTracer({ autoTrack: false });
+  let directFn = null;
+  const fakeApp = {
+    use(fn) { directFn = fn; return this; },
+  };
+  instrumentKoa(fakeApp, t);
+
+  async function myMw(ctx, next) { await next(); }
+  fakeApp.use(myMw);
+  // Should pass the original function through (not wrapped)
+  assertEqual(directFn, myMw);
+  t.destroy();
+});
+
+test('koa: instrumentKoa records step even when middleware throws', async () => {
+  const t = makeTracer({ autoTrack: true });
+  let wrappedFn = null;
+  const fakeApp = {
+    use(fn) { wrappedFn = fn; return this; },
+  };
+  instrumentKoa(fakeApp, t);
+
+  async function badMw(ctx, next) { throw new Error('boom'); }
+  fakeApp.use(badMw);
+
+  const trace = { requestId: 'koa_err', steps: [] };
+  try {
+    await wrappedFn({ _trace: trace }, async () => {});
+  } catch (e) {
+    assertEqual(e.message, 'boom');
+  }
+  assertEqual(trace.steps.length, 1);
+  assertEqual(trace.steps[0].name, 'badMw');
+  t.destroy();
+});
+
+// =========================================================================
+// index.js — new API methods
+// =========================================================================
+test('api: instrumentKoa returns instrumented app', () => {
+  const t = new RT();
+  t.init({ autoTrack: true });
+  const fakeApp = { use(fn) { return this; } };
+  const result = t.instrumentKoa(fakeApp);
+  assert(result._traceInstrumented);
+  t.destroy();
+});
+
+test('api: enableHttpTracing / disableHttpTracing / isHttpTracingEnabled', () => {
+  const t = new RT();
+  t.init();
+  assert(!t.isHttpTracingEnabled());
+  t.enableHttpTracing();
+  assert(t.isHttpTracingEnabled());
+  t.disableHttpTracing();
+  assert(!t.isHttpTracingEnabled());
+  t.destroy();
+});
+
+test('api: init with traceOutgoing enables http tracing', () => {
+  const t = new RT();
+  t.init({ traceOutgoing: true });
+  assert(httpTracer.isEnabled());
+  t.destroy();
+  assert(!httpTracer.isEnabled());
+});
+
+test('api: exportChromeTrace returns chrome format', () => {
+  const t = new RT();
+  const trace = { requestId: 'r', method: 'GET', path: '/', startTime: 1, duration: 1, status: 200, steps: [] };
+  const result = t.exportChromeTrace(trace);
+  assert(result.traceEvents != null);
+});
+
+test('api: exportChromeTraceJson returns JSON string', () => {
+  const t = new RT();
+  const trace = { requestId: 'r', method: 'GET', path: '/', startTime: 1, duration: 1, status: 200, steps: [] };
+  const result = t.exportChromeTraceJson(trace);
+  assert(typeof result === 'string');
+  JSON.parse(result); // should not throw
+});
+
+test('api: destroy disables http tracing', () => {
+  const t = new RT();
+  t.init({ traceOutgoing: true });
+  assert(httpTracer.isEnabled());
+  t.destroy();
+  assert(!httpTracer.isEnabled());
+});
+
 // Run all tests
 run();

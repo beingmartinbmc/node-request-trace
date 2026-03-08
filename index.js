@@ -5,9 +5,12 @@ const TraceStorage = require('./lib/trace-storage');
 const expressMiddleware = require('./lib/middleware/express');
 const fastifyPlugin = require('./lib/middleware/fastify');
 const koaMiddleware = require('./lib/middleware/koa');
+const { instrumentKoa } = require('./lib/middleware/koa');
 const { createRouter } = require('./lib/routes');
 const { createPinoIntegration, createWinstonIntegration, createConsoleIntegration } = require('./lib/logger');
 const { sanitizeHeaders } = require('./lib/security');
+const { enableHttpTracing, disableHttpTracing, isEnabled: isHttpTracingEnabled } = require('./lib/http-tracer');
+const { toChromeTraceFormat, toChromeTraceJson } = require('./lib/chrome-trace');
 
 const DEFAULT_CONFIG = {
   slowThreshold: 200,
@@ -15,6 +18,7 @@ const DEFAULT_CONFIG = {
   maxTraces: 1000,
   retentionSeconds: 300,
   autoTrack: false,
+  traceOutgoing: false,
   logBody: false,
   sensitiveHeaders: null,
 };
@@ -35,6 +39,11 @@ class RequestTracer {
     });
     this.storage.startCleanup();
     this._initialized = true;
+
+    if (this.config.traceOutgoing) {
+      enableHttpTracing();
+    }
+
     return this;
   }
 
@@ -54,6 +63,11 @@ class RequestTracer {
   koaMiddleware() {
     this._ensureInit();
     return koaMiddleware(this);
+  }
+
+  instrumentKoa(app) {
+    this._ensureInit();
+    return instrumentKoa(app, this);
   }
 
   routes() {
@@ -82,6 +96,28 @@ class RequestTracer {
     return this;
   }
 
+  enableHttpTracing() {
+    enableHttpTracing();
+    return this;
+  }
+
+  disableHttpTracing() {
+    disableHttpTracing();
+    return this;
+  }
+
+  isHttpTracingEnabled() {
+    return isHttpTracingEnabled();
+  }
+
+  exportChromeTrace(trace) {
+    return toChromeTraceFormat(trace);
+  }
+
+  exportChromeTraceJson(trace) {
+    return toChromeTraceJson(trace);
+  }
+
   sanitizeHeaders(headers) {
     return sanitizeHeaders(headers, this.config.sensitiveHeaders);
   }
@@ -91,6 +127,7 @@ class RequestTracer {
       this.storage.stopCleanup();
       this.storage.clear();
     }
+    disableHttpTracing();
     this._initialized = false;
   }
 
