@@ -26,14 +26,10 @@ Request tracing and performance visualization library for Node.js. Inspect the f
 
 The library has three core components:
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  Trace Engine    │────▶│  Trace Storage   │────▶│  UI Dashboard   │
-│                  │     │                  │     │                  │
-│  AsyncLocal-     │     │  In-memory store │     │  Real-time viz  │
-│  Storage context │     │  with eviction   │     │  at /trace/ui   │
-│  + step tracking │     │  and retention   │     │                  │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+```mermaid
+graph LR
+  A["<b>Trace Engine</b><br/>AsyncLocalStorage context<br/>+ step tracking"] --> B["<b>Trace Storage</b><br/>In-memory store<br/>with eviction & retention"]
+  B --> C["<b>UI Dashboard</b><br/>Real-time visualization<br/>at /trace/ui"]
 ```
 
 ## Installation
