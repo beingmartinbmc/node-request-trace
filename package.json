@@ -1,0 +1,48 @@
+{
+  "name": "node-request-trace",
+  "version": "1.0.0",
+  "description": "Request tracing and performance visualization library for Node.js",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/"
+  ],
+  "scripts": {
+    "test": "node test/run.js",
+    "test:coverage": "c8 --100 --include='lib/**' --include='index.js' node test/run.js",
+    "example": "node example/express-app.js"
+  },
+  "keywords": [
+    "tracing",
+    "performance",
+    "middleware",
+    "express",
+    "fastify",
+    "koa",
+    "debugging",
+    "monitoring"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "peerDependencies": {
+    "express": ">=4.0.0",
+    "fastify": ">=4.0.0",
+    "koa": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    },
+    "fastify": {
+      "optional": true
+    },
+    "koa": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "c8": "^11.0.0"
+  }
+}
