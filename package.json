@@ -1,11 +1,15 @@
 {
   "name": "node-request-trace",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Request tracing and performance visualization library for Node.js",
   "main": "index.js",
+  "bin": {
+    "node-request-trace": "./bin/cli.js"
+  },
   "files": [
     "index.js",
-    "lib/"
+    "lib/",
+    "bin/"
   ],
   "scripts": {
     "test": "node test/run.js",
@@ -22,7 +26,16 @@
     "debugging",
     "monitoring"
   ],
+  "author": "beingmartinbmc",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beingmartinbmc/node-request-trace.git"
+  },
+  "homepage": "https://github.com/beingmartinbmc/node-request-trace#readme",
+  "bugs": {
+    "url": "https://github.com/beingmartinbmc/node-request-trace/issues"
+  },
   "engines": {
     "node": ">=16.0.0"
   },
