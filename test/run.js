@@ -743,6 +743,43 @@ test('routes: /trace/:requestId with underscores in ID', () => {
   t.destroy();
 });
 
+test('routes: /trace/:requestId/timeline returns timeline report', () => {
+  const t = makeTracer();
+  const trace = {
+    requestId: 'req_timeline',
+    method: 'GET',
+    path: '/checkout',
+    startTime: 1000,
+    duration: 100,
+    status: 200,
+    steps: [
+      { name: 'auth', start: 1010, duration: 10 },
+      { name: 'db', start: 1030, duration: 50, type: 'db' },
+    ],
+  };
+  t.storage.store(trace);
+  const router = createRouter(t);
+  const res = mockRes();
+  router({ url: '/trace/req_timeline/timeline' }, res);
+  assertEqual(res._status, 200);
+  const data = JSON.parse(res._body);
+  assertEqual(data.requestId, 'req_timeline');
+  assertEqual(data.summary.bottleneck.name, 'db');
+  assert(data.text.includes('bottleneck: db 50ms'));
+  t.destroy();
+});
+
+test('routes: /trace/:requestId/timeline returns 404 when not found', () => {
+  const t = makeTracer();
+  const router = createRouter(t);
+  const res = mockRes();
+  router({ url: '/trace/missing/timeline' }, res);
+  assertEqual(res._status, 404);
+  const data = JSON.parse(res._body);
+  assertEqual(data.error, 'Trace not found');
+  t.destroy();
+});
+
 // =========================================================================
 // middleware/express.js
 // =========================================================================
@@ -1582,6 +1619,102 @@ test('chrome-trace: toChromeTraceJson returns valid JSON', () => {
 });
 
 // =========================================================================
+// lib/timeline.js
+// =========================================================================
+const { buildTimeline, renderTimeline } = require('../lib/timeline');
+
+test('timeline: buildTimeline summarizes bottleneck, gaps, and coverage', () => {
+  const report = buildTimeline({
+    requestId: 'tl1',
+    method: 'GET',
+    path: '/checkout',
+    startTime: 1000,
+    duration: 100,
+    status: 200,
+    steps: [
+      { name: 'auth', start: 1010, duration: 10 },
+      { name: 'db', start: 1030, duration: 50, type: 'db' },
+      { name: 'render', start: 1090, duration: 5 },
+    ],
+  });
+
+  assertEqual(report.requestId, 'tl1');
+  assertEqual(report.stepCount, 3);
+  assertEqual(report.summary.bottleneck.name, 'db');
+  assertEqual(report.summary.coveredDuration, 65);
+  assertEqual(report.summary.uninstrumentedDuration, 35);
+  assert(report.summary.gaps.length >= 1);
+  assertEqual(report.steps[1].type, 'db');
+});
+
+test('timeline: overlapping steps do not inflate covered duration', () => {
+  const report = buildTimeline({
+    method: 'GET',
+    path: '/overlap',
+    startTime: 0,
+    duration: 100,
+    status: 200,
+    steps: [
+      { name: 'a', start: 10, duration: 50 },
+      { name: 'b', start: 20, duration: 50 },
+    ],
+  });
+
+  assertEqual(report.summary.stepTotalDuration, 100);
+  assertEqual(report.summary.coveredDuration, 60);
+  assertEqual(report.summary.uninstrumentedDuration, 40);
+});
+
+test('timeline: buildTimeline supports missing steps', () => {
+  const report = buildTimeline({ method: 'GET', path: '/', duration: 0, status: 200 });
+  assertEqual(report.stepCount, 0);
+  assertEqual(report.summary.bottleneck, null);
+  assertEqual(report.summary.coveragePercent, 0);
+});
+
+test('timeline: buildTimeline estimates duration from steps when absent', () => {
+  const report = buildTimeline({
+    method: 'GET',
+    path: '/estimate',
+    steps: [{ name: 'work', start: 100, duration: 25 }],
+  });
+  assertEqual(report.totalDuration, 25);
+  assertEqual(report.steps[0].offset, 0);
+});
+
+test('timeline: buildTimeline throws when trace is missing', () => {
+  let threw = false;
+  try {
+    buildTimeline(null);
+  } catch (e) {
+    threw = true;
+    assert(e.message.includes('trace is required'));
+  }
+  assert(threw);
+});
+
+test('timeline: renderTimeline returns copy-pasteable ascii', () => {
+  const text = renderTimeline({
+    requestId: 'tl_render',
+    method: 'POST',
+    path: '/pay',
+    startTime: 10,
+    duration: 50,
+    status: 500,
+    steps: [{ name: 'charge', start: 20, duration: 30, error: 'declined' }],
+  }, { width: 24 });
+
+  assert(text.includes('POST /pay 50ms (500)'));
+  assert(text.includes('bottleneck: charge 30ms'));
+  assert(text.includes('ERROR: declined'));
+});
+
+test('timeline: renderTimeline handles empty traces', () => {
+  const text = renderTimeline({ method: 'GET', path: '/', duration: 0, status: 200 });
+  assert(text.includes('no steps recorded'));
+});
+
+// =========================================================================
 // lib/http-tracer.js
 // =========================================================================
 const httpTracer = require('../lib/http-tracer');
@@ -2273,6 +2406,38 @@ test('api: exportChromeTraceJson returns JSON string', () => {
   const result = t.exportChromeTraceJson(trace);
   assert(typeof result === 'string');
   JSON.parse(result); // should not throw
+});
+
+test('api: timeline returns structured report', () => {
+  const t = new RT();
+  const trace = {
+    requestId: 'api_tl',
+    method: 'POST',
+    path: '/pay',
+    startTime: 1000,
+    duration: 200,
+    status: 201,
+    steps: [{ name: 'charge', start: 1050, duration: 100 }],
+  };
+  const report = t.timeline(trace);
+  assertEqual(report.summary.bottleneck.name, 'charge');
+  assertEqual(report.summary.coveragePercent, 50);
+});
+
+test('api: renderTimeline returns ascii report', () => {
+  const t = new RT();
+  const trace = {
+    requestId: 'api_render',
+    method: 'GET',
+    path: '/debug',
+    startTime: 10,
+    duration: 20,
+    status: 200,
+    steps: [{ name: 'work', start: 15, duration: 5 }],
+  };
+  const text = t.renderTimeline(trace, { width: 20 });
+  assert(text.includes('GET /debug 20ms (200)'));
+  assert(text.includes('coverage: 5ms traced'));
 });
 
 test('api: destroy disables http tracing', () => {

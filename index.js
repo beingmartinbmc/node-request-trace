@@ -11,6 +11,7 @@ const { createPinoIntegration, createWinstonIntegration, createConsoleIntegratio
 const { sanitizeHeaders } = require('./lib/security');
 const { enableHttpTracing, disableHttpTracing, isEnabled: isHttpTracingEnabled } = require('./lib/http-tracer');
 const { toChromeTraceFormat, toChromeTraceJson } = require('./lib/chrome-trace');
+const { buildTimeline, renderTimeline: renderTimelineReport } = require('./lib/timeline');
 
 const DEFAULT_CONFIG = {
   slowThreshold: 200,
@@ -116,6 +117,14 @@ class RequestTracer {
 
   exportChromeTraceJson(trace) {
     return toChromeTraceJson(trace);
+  }
+
+  timeline(trace = this.current()) {
+    return buildTimeline(trace);
+  }
+
+  renderTimeline(trace = this.current(), options) {
+    return renderTimelineReport(trace, options);
   }
 
   sanitizeHeaders(headers) {
