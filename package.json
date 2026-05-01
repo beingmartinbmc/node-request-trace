@@ -1,7 +1,7 @@
 {
   "name": "node-request-trace",
-  "version": "2.0.0",
-  "description": "Request tracing and performance visualization library for Node.js",
+  "version": "2.1.0",
+  "description": "Debug Node.js requests as timelines without OpenTelemetry",
   "main": "index.js",
   "bin": {
     "node-request-trace": "./bin/cli.js"
@@ -12,8 +12,11 @@
     "bin/"
   ],
   "scripts": {
+    "lint": "sh -c 'for f in index.js bin/cli.js lib/*.js lib/middleware/*.js test/run.js; do node --check \"$f\"; done'",
+    "typecheck": "npm run lint",
+    "build": "npm pack --dry-run",
     "test": "node test/run.js",
-    "test:coverage": "c8 --100 --include='lib/**' --include='index.js' node test/run.js",
+    "test:coverage": "c8 --check-coverage --lines 90 --functions 90 --branches 90 --statements 90 --include='lib/**' --include='index.js' node test/run.js",
     "example": "node example/express-app.js"
   },
   "keywords": [
@@ -24,7 +27,9 @@
     "fastify",
     "koa",
     "debugging",
-    "monitoring"
+    "monitoring",
+    "timeline",
+    "opentelemetry-alternative"
   ],
   "author": "beingmartinbmc",
   "license": "MIT",

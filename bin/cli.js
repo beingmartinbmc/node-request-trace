@@ -29,6 +29,7 @@ ${BOLD}Commands:${RESET}
   ${GREEN}recent${RESET}   <url>          Show recent traces
   ${GREEN}slow${RESET}     <url>          Show slow traces
   ${GREEN}inspect${RESET}  <url> <id>     Show single trace detail
+  ${GREEN}timeline${RESET} <url> <id>     Show request timeline report
   ${GREEN}tail${RESET}     <url>          Live tail of incoming traces
   ${GREEN}export${RESET}   <url> <id>     Export trace as Chrome Trace JSON
 
@@ -36,6 +37,7 @@ ${BOLD}Examples:${RESET}
   npx node-request-trace stats http://localhost:3000
   npx node-request-trace recent http://localhost:3000
   npx node-request-trace inspect http://localhost:3000 req_abc123
+  npx node-request-trace timeline http://localhost:3000 req_abc123
   npx node-request-trace tail http://localhost:3000
   npx node-request-trace export http://localhost:3000 req_abc123 > trace.json
 `;
@@ -203,6 +205,16 @@ async function cmdInspect(baseUrl, requestId) {
   printTraceDetail(trace);
 }
 
+async function cmdTimeline(baseUrl, requestId) {
+  if (!requestId) {
+    console.error(`${RED}Error: request ID required${RESET}`);
+    console.error('Usage: npx node-request-trace timeline <url> <request-id>');
+    process.exit(1);
+  }
+  const report = await fetchJson(`${baseUrl}/trace/${requestId}/timeline`);
+  console.log('\n' + report.text + '\n');
+}
+
 async function cmdTail(baseUrl) {
   console.log(`${BOLD}  Tailing traces from ${baseUrl}${RESET}`);
   console.log(`  ${DIM}Press Ctrl+C to stop${RESET}\n`);
@@ -280,6 +292,7 @@ async function main() {
       case 'recent':  return await cmdRecent(cleanUrl);
       case 'slow':    return await cmdSlow(cleanUrl);
       case 'inspect': return await cmdInspect(cleanUrl, args[2]);
+      case 'timeline': return await cmdTimeline(cleanUrl, args[2]);
       case 'tail':    return await cmdTail(cleanUrl);
       case 'export':  return await cmdExport(cleanUrl, args[2]);
       default:
@@ -312,6 +325,7 @@ module.exports = {
   cmdRecent,
   cmdSlow,
   cmdInspect,
+  cmdTimeline,
   cmdTail,
   cmdExport,
 };
