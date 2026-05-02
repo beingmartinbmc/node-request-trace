@@ -10,6 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   test:
     name: Test (Node ${{ matrix.node }})
@@ -39,5 +42,5 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test with coverage
+      - name: Test with coverage gate (>=90%)
         run: npm run test:coverage
