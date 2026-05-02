@@ -1340,6 +1340,39 @@ test('api: current() returns null outside context', () => {
   t.destroy();
 });
 
+test('api: getCurrentTrace() aliases current()', async () => {
+  const t = new RT();
+  t.init();
+  const trace = engine.createTrace({ method: 'GET', url: '/api', headers: {} });
+  await engine.runWithTrace(trace, async () => {
+    assertEqual(t.getCurrentTrace(), t.current());
+    assertEqual(t.getCurrentTrace().requestId, trace.requestId);
+  });
+  t.destroy();
+});
+
+test('api: getCurrentRequestContext() returns compact request context', async () => {
+  const t = new RT();
+  t.init();
+  const trace = engine.createTrace({ method: 'POST', url: '/checkout', headers: { 'x-request-id': 'req-1' } });
+  await engine.runWithTrace(trace, async () => {
+    const ctx = t.getCurrentRequestContext();
+    assertEqual(ctx.requestId, 'req-1');
+    assertEqual(ctx.method, 'POST');
+    assertEqual(ctx.path, '/checkout');
+    assertEqual(ctx.route, '/checkout');
+    assertEqual(ctx.startTime, trace.startTime);
+  });
+  t.destroy();
+});
+
+test('api: getCurrentRequestContext() returns null outside context', () => {
+  const t = new RT();
+  t.init();
+  assertEqual(t.getCurrentRequestContext(), null);
+  t.destroy();
+});
+
 test('api: step() works inside trace context', async () => {
   const t = new RT();
   t.init();

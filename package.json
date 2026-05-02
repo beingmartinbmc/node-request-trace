@@ -3,11 +3,13 @@
   "version": "2.1.0",
   "description": "Debug Node.js requests as timelines without OpenTelemetry",
   "main": "index.js",
+  "types": "index.d.ts",
   "bin": {
     "node-request-trace": "./bin/cli.js"
   },
   "files": [
     "index.js",
+    "index.d.ts",
     "lib/",
     "bin/"
   ],
