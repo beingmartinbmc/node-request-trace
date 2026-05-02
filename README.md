@@ -92,6 +92,21 @@ Use `node-request-trace` when you want a lightweight developer experience:
 
 Use OpenTelemetry when you need distributed traces across many services, vendor integration, long-term retention, metrics/log correlation, or organization-wide observability standards.
 
+## Ecosystem
+
+`node-request-trace` is part of a small Node.js observability ecosystem you can adopt independently or together:
+
+- [`node-actuator-lite`](https://github.com/beingmartinbmc/node-actuator-lite) — Spring Boot-style `/actuator/health`, `/info`, `/metrics`, `/env`, `/threaddump`, `/heapdump`, and `/prometheus` endpoints.
+- [`node-eventloop-watchdog`](https://github.com/beingmartinbmc/node-eventloop-watchdog) — Detects event-loop stalls, captures stack traces and hotspots, and triggers recovery.
+- **`node-request-trace`** — Per-request timelines, browser dashboard, and CLI without OpenTelemetry.
+
+When all three are installed:
+
+- `node-eventloop-watchdog` automatically registers `/actuator/eventloop`, `/actuator/eventloop/history`, `/actuator/eventloop/hotspots`, and `/actuator/eventloop/metrics` under `node-actuator-lite`.
+- Event-loop block events include the active request id, route, and method captured by this tracer via `getCurrentRequestContext()`.
+
+Runnable example: [`node-actuator-lite/examples/ecosystem`](https://github.com/beingmartinbmc/node-actuator-lite/tree/main/examples/ecosystem).
+
 ## Installation
 
 ```bash
