@@ -1,6 +1,6 @@
 {
   "name": "node-request-trace",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Debug Node.js requests as timelines without OpenTelemetry",
   "main": "index.js",
   "types": "index.d.ts",
