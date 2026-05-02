@@ -80,6 +80,24 @@ class RequestTracer {
     return currentTrace();
   }
 
+  getCurrentTrace() {
+    return this.current();
+  }
+
+  getCurrentRequestContext() {
+    const trace = this.current();
+    if (!trace) return null;
+    return {
+      requestId: trace.requestId,
+      method: trace.method,
+      path: trace.path,
+      route: trace.route || trace.path,
+      status: trace.status,
+      duration: trace.duration,
+      startTime: trace.startTime,
+    };
+  }
+
   async step(name, fn) {
     return addStep(name, fn);
   }
