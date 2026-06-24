@@ -2481,5 +2481,706 @@ test('api: destroy disables http tracing', () => {
   assert(!httpTracer.isEnabled());
 });
 
+// =========================================================================
+// analysis.js — N+1 / duplicate detection
+// =========================================================================
+const analysis = require('../lib/analysis');
+
+test('analysis: normalizeStepName collapses ids, uuids, literals', () => {
+  assertEqual(
+    analysis.normalizeStepName('SELECT * FROM users WHERE id = 42'),
+    'SELECT * FROM users WHERE id = ?'
+  );
+  assertEqual(
+    analysis.normalizeStepName("SELECT * FROM t WHERE name = 'bob'"),
+    "SELECT * FROM t WHERE name = '?'"
+  );
+  assertEqual(
+    analysis.normalizeStepName('GET /api/users/123?foo=bar'),
+    'GET /api/users/?'
+  );
+  assertEqual(
+    analysis.normalizeStepName('find 507f1f77bcf86cd799439011'),
+    'find <hex>'
+  );
+});
+
+test('analysis: analyzeRepetition flags N+1 above threshold', () => {
+  const steps = [];
+  for (let i = 1; i <= 6; i++) {
+    steps.push({ name: `SELECT * FROM users WHERE id = ${i}`, duration: 10, type: 'db' });
+  }
+  const result = analysis.analyzeRepetition(steps);
+  assert(result.hasNPlusOne, 'should detect N+1');
+  assertEqual(result.duplicates[0].count, 6);
+  assertEqual(result.duplicates[0].isNPlusOne, true);
+  assertEqual(result.duplicates[0].totalDuration, 60);
+});
+
+test('analysis: duplicates under N+1 threshold are not N+1', () => {
+  const steps = [
+    { name: 'cache.get key 1', duration: 2 },
+    { name: 'cache.get key 2', duration: 2 },
+    { name: 'cache.get key 3', duration: 2 },
+  ];
+  const result = analysis.analyzeRepetition(steps);
+  assertEqual(result.duplicateCount, 1);
+  assertEqual(result.hasNPlusOne, false);
+});
+
+test('analysis: unique steps produce no duplicates', () => {
+  const steps = [
+    { name: 'auth', duration: 5 },
+    { name: 'render', duration: 8 },
+  ];
+  const result = analysis.analyzeRepetition(steps);
+  assertEqual(result.duplicateCount, 0);
+  assertEqual(result.wastedDuration, 0);
+});
+
+test('analysis: wastedDuration excludes one max-cost run', () => {
+  const steps = [
+    { name: 'q 1', duration: 10 },
+    { name: 'q 2', duration: 10 },
+    { name: 'q 3', duration: 30 },
+  ];
+  const result = analysis.analyzeRepetition(steps);
+  // total 50, minus the single max (30) = 20 wasted
+  assertEqual(result.wastedDuration, 20);
+});
+
+test('analysis: formatRepetitionWarnings produces lines', () => {
+  const steps = [];
+  for (let i = 0; i < 5; i++) steps.push({ name: `q ${i}`, duration: 4 });
+  const result = analysis.analyzeRepetition(steps);
+  const lines = analysis.formatRepetitionWarnings(result, { ascii: true });
+  assertEqual(lines.length, 1);
+  assert(lines[0].includes('N+1 detected'));
+  assert(lines[0].includes('ran 5×'));
+});
+
+test('analysis: empty/invalid steps are safe', () => {
+  assertEqual(analysis.analyzeRepetition().duplicateCount, 0);
+  assertEqual(analysis.analyzeRepetition(null).duplicateCount, 0);
+  assertEqual(analysis.analyzeRepetition([]).duplicateCount, 0);
+});
+
+// =========================================================================
+// speedscope.js — flamegraph export
+// =========================================================================
+const speedscope = require('../lib/speedscope');
+
+test('speedscope: toSpeedscope produces evented profile', () => {
+  const trace = {
+    requestId: 'ss1', method: 'GET', path: '/x', startTime: 100, duration: 50, status: 200,
+    steps: [
+      { name: 'a', start: 100, duration: 10 },
+      { name: 'b', start: 110, duration: 20 },
+    ],
+  };
+  const out = speedscope.toSpeedscope(trace);
+  assertEqual(out.profiles[0].type, 'evented');
+  assertEqual(out.shared.frames.length, 2);
+  assertEqual(out.profiles[0].events.length, 4); // 2 open + 2 close
+  assertEqual(out.profiles[0].unit, 'milliseconds');
+});
+
+test('speedscope: events are time-ordered with closes before opens on ties', () => {
+  const trace = {
+    startTime: 0, duration: 10,
+    steps: [
+      { name: 'a', start: 0, duration: 5 },
+      { name: 'b', start: 5, duration: 5 },
+    ],
+  };
+  const events = speedscope.toSpeedscope(trace).profiles[0].events;
+  for (let i = 1; i < events.length; i++) {
+    assert(events[i].at >= events[i - 1].at, 'events must be non-decreasing in time');
+  }
+  // At t=5: close of 'a' must come before open of 'b'
+  const atFive = events.filter(e => e.at === 5);
+  assertEqual(atFive[0].type, 'C');
+  assertEqual(atFive[1].type, 'O');
+});
+
+test('speedscope: toSpeedscopeJson returns valid JSON string', () => {
+  const json = speedscope.toSpeedscopeJson({ startTime: 0, duration: 1, steps: [] });
+  const parsed = JSON.parse(json);
+  assertEqual(parsed.exporter, 'node-request-trace');
+});
+
+test('speedscope: error steps get labeled frames', () => {
+  const out = speedscope.toSpeedscope({
+    startTime: 0, duration: 5,
+    steps: [{ name: 'boom', start: 0, duration: 5, error: 'x' }],
+  });
+  assert(out.shared.frames[0].name.includes('(error)'));
+});
+
+// =========================================================================
+// markdown.js — GitHub-flavored export
+// =========================================================================
+const markdown = require('../lib/markdown');
+
+test('markdown: toMarkdown renders collapsible summary and table', () => {
+  const trace = {
+    requestId: 'md1', method: 'POST', path: '/pay', startTime: 0, duration: 120, status: 201,
+    steps: [{ name: 'charge', start: 10, duration: 100, type: 'http' }],
+  };
+  const md = markdown.toMarkdown(trace);
+  assert(md.includes('<details>'));
+  assert(md.includes('</details>'));
+  assert(md.includes('`POST /pay`'));
+  assert(md.includes('| Step | Start | Duration | % | Type |'));
+  assert(md.includes('charge'));
+  assert(md.includes('```txt'));
+});
+
+test('markdown: slow trace gets turtle emoji', () => {
+  const trace = { method: 'GET', path: '/', startTime: 0, duration: 900, status: 200, steps: [] };
+  const md = markdown.toMarkdown(trace, { slowThreshold: 500 });
+  assert(md.includes('🐢'));
+});
+
+test('markdown: fast trace gets lightning emoji', () => {
+  const trace = { method: 'GET', path: '/', startTime: 0, duration: 5, status: 200, steps: [] };
+  const md = markdown.toMarkdown(trace, { slowThreshold: 500 });
+  assert(md.includes('⚡'));
+});
+
+test('markdown: N+1 surfaces in markdown bullets', () => {
+  const steps = [];
+  for (let i = 1; i <= 5; i++) steps.push({ name: `SELECT x WHERE id = ${i}`, start: i, duration: 5, type: 'db' });
+  const md = markdown.toMarkdown({ method: 'GET', path: '/n', startTime: 0, duration: 30, status: 200, steps });
+  assert(md.includes('N+1 detected'));
+});
+
+test('markdown: pipe characters in step names are escaped', () => {
+  const trace = {
+    method: 'GET', path: '/', startTime: 0, duration: 10, status: 200,
+    steps: [{ name: 'a | b', start: 0, duration: 5 }],
+  };
+  const md = markdown.toMarkdown(trace);
+  assert(md.includes('a \\| b'));
+});
+
+// =========================================================================
+// snapshot.js — self-contained HTML
+// =========================================================================
+const snapshot = require('../lib/snapshot');
+
+test('snapshot: toShareableHtml is self-contained (no external src/href except repo link)', () => {
+  const trace = {
+    requestId: 'snap1', method: 'GET', path: '/u', startTime: 0, duration: 30, status: 200,
+    steps: [{ name: 'work', start: 0, duration: 30 }],
+  };
+  const html = snapshot.toShareableHtml(trace);
+  assert(html.startsWith('<!DOCTYPE html>'));
+  assert(html.includes('const R ='));
+  // No external scripts/styles
+  assert(!/<script[^>]+src=/.test(html), 'no external scripts');
+  assert(!/<link[^>]+href=/.test(html), 'no external stylesheets');
+});
+
+test('snapshot: embeds trace data and escapes closing tags', () => {
+  const trace = {
+    method: 'GET', path: '/</script>', startTime: 0, duration: 5, status: 200,
+    steps: [{ name: '<b>x</b>', start: 0, duration: 5 }],
+  };
+  const html = snapshot.toShareableHtml(trace);
+  // The embedded JSON must not contain a raw closing script tag
+  assert(!html.includes('</script>x'), 'no premature script close in data');
+  assert(html.includes('\\u003c/script>') || html.includes('\\u003c'), 'angle brackets escaped in data');
+});
+
+// =========================================================================
+// diff.js — regression diff
+// =========================================================================
+const diffMod = require('../lib/diff');
+
+function mkTrace(dur, steps) {
+  return { method: 'GET', path: '/d', startTime: 0, duration: dur, status: 200, steps };
+}
+
+test('diff: detects slower step and regression', () => {
+  const a = mkTrace(100, [{ name: 'db query', start: 0, duration: 40 }]);
+  const b = mkTrace(160, [{ name: 'db query', start: 0, duration: 100 }]);
+  const d = diffMod.diffTraces(a, b, { regressionPercent: 10 });
+  assertEqual(d.totalDeltaMs, 60);
+  assertEqual(d.regressed, true);
+  assertEqual(d.slower.length, 1);
+  assertEqual(d.slower[0].deltaMs, 60);
+});
+
+test('diff: detects added and removed steps', () => {
+  const a = mkTrace(50, [{ name: 'old step', start: 0, duration: 50 }]);
+  const b = mkTrace(60, [{ name: 'new step', start: 0, duration: 60 }]);
+  const d = diffMod.diffTraces(a, b);
+  assertEqual(d.added.length, 1);
+  assertEqual(d.removed.length, 1);
+  assertEqual(d.added[0].name, 'new step');
+  assertEqual(d.removed[0].name, 'old step');
+});
+
+test('diff: faster step is not a regression', () => {
+  const a = mkTrace(100, [{ name: 'x', start: 0, duration: 80 }]);
+  const b = mkTrace(40, [{ name: 'x', start: 0, duration: 20 }]);
+  const d = diffMod.diffTraces(a, b, { regressionPercent: 5 });
+  assertEqual(d.regressed, false);
+  assertEqual(d.faster.length, 1);
+});
+
+test('diff: normalized step names group across dynamic ids', () => {
+  const a = mkTrace(20, [{ name: 'SELECT WHERE id = 1', start: 0, duration: 20 }]);
+  const b = mkTrace(40, [{ name: 'SELECT WHERE id = 2', start: 0, duration: 40 }]);
+  const d = diffMod.diffTraces(a, b);
+  assertEqual(d.steps.length, 1);
+  assertEqual(d.steps[0].status, 'slower');
+});
+
+test('diff: diffToMarkdown renders table and regression flag', () => {
+  const a = mkTrace(100, [{ name: 'q', start: 0, duration: 40 }]);
+  const b = mkTrace(200, [{ name: 'q', start: 0, duration: 140 }]);
+  const md = diffMod.diffToMarkdown(diffMod.diffTraces(a, b, { regressionPercent: 10 }));
+  assert(md.includes('Trace diff'));
+  assert(md.includes('regression'));
+  assert(md.includes('| Step | Before | After |'));
+});
+
+// =========================================================================
+// explain.js — AI prompt builder
+// =========================================================================
+const explain = require('../lib/explain');
+
+test('explain: buildExplainPrompt includes facts and steps', () => {
+  const trace = {
+    method: 'GET', path: '/slow', startTime: 0, duration: 500, status: 200,
+    steps: [{ name: 'db', start: 0, duration: 450, type: 'db' }],
+  };
+  const { system, user } = explain.buildExplainPrompt(trace);
+  assert(system.includes('performance engineer'));
+  assert(user.includes('GET /slow'));
+  assert(user.includes('Bottleneck'));
+  assert(user.includes('db: 450ms'));
+});
+
+test('explain: prompt surfaces N+1 patterns', () => {
+  const steps = [];
+  for (let i = 1; i <= 6; i++) steps.push({ name: `SELECT id = ${i}`, start: i, duration: 5, type: 'db' });
+  const { user } = explain.buildExplainPrompt(mkTrace(60, steps));
+  assert(user.includes('N+1 pattern'));
+});
+
+test('explain: explainTrace rejects without API key', async () => {
+  const saved = { o: process.env.OPENAI_API_KEY, l: process.env.LLM_API_KEY };
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.LLM_API_KEY;
+  let threw = false;
+  try {
+    await explain.explainTrace(mkTrace(10, []));
+  } catch (err) {
+    threw = true;
+    assertEqual(err.code, 'NO_API_KEY');
+  }
+  if (saved.o) process.env.OPENAI_API_KEY = saved.o;
+  if (saved.l) process.env.LLM_API_KEY = saved.l;
+  assert(threw, 'should throw without API key');
+});
+
+// =========================================================================
+// auto-instrument.js
+// =========================================================================
+const autoInstrument = require('../lib/auto-instrument');
+const { runWithTrace: rwtAI } = require('../lib/trace-engine');
+
+test('auto-instrument: enable returns applied list (best-effort)', () => {
+  const applied = autoInstrument.enableAutoInstrumentation();
+  assert(Array.isArray(applied));
+  autoInstrument.disableAutoInstrumentation();
+});
+
+test('auto-instrument: instrumentKnexInstance wires event hooks', () => {
+  const { EventEmitter } = require('node:events');
+  const fakeKnex = new EventEmitter();
+  const returned = autoInstrument.instrumentKnexInstance(fakeKnex);
+  assertEqual(returned, fakeKnex);
+  const trace = { steps: [] };
+  rwtAI(trace, () => {
+    const q = { __knexQueryUid: 'u1', sql: 'SELECT 1' };
+    fakeKnex.emit('query', q);
+    fakeKnex.emit('query-response', {}, q);
+  });
+  assertEqual(trace.steps.length, 1);
+  assert(trace.steps[0].name.includes('knex'));
+});
+
+test('auto-instrument: instrumentKnexInstance records query errors', () => {
+  const { EventEmitter } = require('node:events');
+  const fakeKnex = new EventEmitter();
+  autoInstrument.instrumentKnexInstance(fakeKnex);
+  const trace = { steps: [] };
+  rwtAI(trace, () => {
+    const q = { __knexQueryUid: 'e1', sql: 'BAD SQL' };
+    fakeKnex.emit('query', q);
+    fakeKnex.emit('query-error', new Error('boom'), q);
+  });
+  assertEqual(trace.steps[0].error, 'boom');
+});
+
+test('auto-instrument: instrumentPrismaClient registers $use middleware', async () => {
+  let registered = null;
+  const fakeClient = { $use(fn) { registered = fn; } };
+  const returned = autoInstrument.instrumentPrismaClient(fakeClient);
+  assertEqual(returned, fakeClient);
+  assert(typeof registered === 'function');
+  const trace = { steps: [] };
+  await rwtAI(trace, async () => {
+    await registered({ model: 'User', action: 'findMany' }, async () => ['ok']);
+  });
+  assertEqual(trace.steps.length, 1);
+  assert(trace.steps[0].name.includes('prisma User.findMany'));
+});
+
+test('auto-instrument: null instances are returned untouched', () => {
+  assertEqual(autoInstrument.instrumentKnexInstance(null), null);
+  assertEqual(autoInstrument.instrumentPrismaClient(null), null);
+});
+
+// =========================================================================
+// public API — new viral features
+// =========================================================================
+const { RequestTracer: RTViral } = require('../index');
+
+test('api: analyze detects N+1 on a trace', () => {
+  const t = new RTViral();
+  const steps = [];
+  for (let i = 1; i <= 5; i++) steps.push({ name: `SELECT id=${i}`, start: i, duration: 4 });
+  const result = t.analyze({ steps });
+  assert(result.hasNPlusOne);
+});
+
+test('api: exportSpeedscope / exportSpeedscopeJson', () => {
+  const t = new RTViral();
+  const trace = { startTime: 0, duration: 10, steps: [{ name: 'a', start: 0, duration: 10 }] };
+  assertEqual(t.exportSpeedscope(trace).profiles[0].type, 'evented');
+  assert(typeof t.exportSpeedscopeJson(trace) === 'string');
+});
+
+test('api: toShareableHtml and toMarkdown', () => {
+  const t = new RTViral();
+  const trace = { method: 'GET', path: '/x', startTime: 0, duration: 10, status: 200, steps: [] };
+  assert(t.toShareableHtml(trace).startsWith('<!DOCTYPE html>'));
+  assert(t.toMarkdown(trace).includes('<details>'));
+});
+
+test('api: diff and diffToMarkdown', () => {
+  const t = new RTViral();
+  const a = mkTrace(100, [{ name: 'q', start: 0, duration: 40 }]);
+  const b = mkTrace(180, [{ name: 'q', start: 0, duration: 120 }]);
+  assertEqual(t.diff(a, b, { regressionPercent: 10 }).regressed, true);
+  assert(t.diffToMarkdown(a, b).includes('Trace diff'));
+});
+
+test('api: buildExplainPrompt returns system+user', () => {
+  const t = new RTViral();
+  const p = t.buildExplainPrompt(mkTrace(10, [{ name: 'x', start: 0, duration: 10 }]));
+  assert(p.system && p.user);
+});
+
+test('api: timeline summary now includes N+1 fields', () => {
+  const t = new RTViral();
+  const steps = [];
+  for (let i = 1; i <= 5; i++) steps.push({ name: `SELECT id=${i}`, start: i, duration: 4 });
+  const report = t.timeline({ requestId: 'r', method: 'GET', path: '/n', startTime: 0, duration: 30, status: 200, steps });
+  assertEqual(report.summary.hasNPlusOne, true);
+  assert(Array.isArray(report.summary.nPlusOne));
+  assert(report.summary.duplicates.length >= 1);
+});
+
+test('api: renderTimeline includes N+1 warning line', () => {
+  const t = new RTViral();
+  const steps = [];
+  for (let i = 1; i <= 5; i++) steps.push({ name: `SELECT id=${i}`, start: i, duration: 4 });
+  const text = t.renderTimeline({ method: 'GET', path: '/n', startTime: 0, duration: 30, status: 200, steps }, { ascii: true });
+  assert(text.includes('N+1 detected'));
+});
+
+test('api: init with autoInstrument enables and destroy disables', () => {
+  const t = new RTViral();
+  t.init({ autoInstrument: true });
+  assert(Array.isArray(t._autoInstrumented));
+  t.destroy();
+  assertEqual(t._autoInstrumented.length, 0);
+});
+
+// =========================================================================
+// routes.js — new export endpoints
+// =========================================================================
+const { createRouter: createRouterV } = require('../lib/routes');
+
+function mockResV() {
+  const r = { _status: 0, _headers: {}, _body: '' };
+  r.writeHead = (code, headers) => { r._status = code; Object.assign(r._headers, headers || {}); };
+  r.end = (data) => { r._body = data || ''; };
+  r.statusCode = 200;
+  return r;
+}
+
+function tracerWithTraces() {
+  const { RequestTracer } = require('../index');
+  const t = new RequestTracer();
+  t.init();
+  const mk = (id, dur, qDur) => t.storage.store({
+    requestId: id, method: 'GET', path: '/u', startTime: 1000, duration: dur, status: 200,
+    steps: [{ name: 'SELECT WHERE id = 1', start: 1000, duration: qDur, type: 'db' }],
+  });
+  mk('rv_a', 100, 40);
+  mk('rv_b', 200, 120);
+  return t;
+}
+
+test('routes: /trace/:id/speedscope returns evented profile', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/rv_a/speedscope' }, res);
+  assertEqual(res._status, 200);
+  assertEqual(JSON.parse(res._body).profiles[0].type, 'evented');
+  t.destroy();
+});
+
+test('routes: /trace/:id/speedscope 404 for missing', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/nope/speedscope' }, res);
+  assertEqual(res._status, 404);
+  t.destroy();
+});
+
+test('routes: /trace/:id/markdown returns markdown', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/rv_a/markdown' }, res);
+  assertEqual(res._status, 200);
+  assert(res._headers['Content-Type'].includes('text/markdown'));
+  assert(res._body.includes('<details>'));
+  t.destroy();
+});
+
+test('routes: /trace/:id/markdown 404 for missing', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/nope/markdown' }, res);
+  assertEqual(res._status, 404);
+  t.destroy();
+});
+
+test('routes: /trace/:id/snapshot returns downloadable html', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/rv_a/snapshot' }, res);
+  assertEqual(res._status, 200);
+  assert(res._headers['Content-Disposition'].includes('rv_a.html'));
+  assert(res._body.startsWith('<!DOCTYPE html>'));
+  t.destroy();
+});
+
+test('routes: /trace/:id/snapshot 404 for missing', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/nope/snapshot' }, res);
+  assertEqual(res._status, 404);
+  t.destroy();
+});
+
+test('routes: /trace/diff/:a/:b returns diff json', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/diff/rv_a/rv_b' }, res);
+  assertEqual(res._status, 200);
+  const d = JSON.parse(res._body);
+  assertEqual(d.totalDeltaMs, 100);
+  t.destroy();
+});
+
+test('routes: /trace/diff 404 when a trace missing', () => {
+  const t = tracerWithTraces();
+  const res = mockResV();
+  createRouterV(t)({ url: '/trace/diff/rv_a/nope' }, res);
+  assertEqual(res._status, 404);
+  t.destroy();
+});
+
+// =========================================================================
+// explain.js — LLM call paths (mocked fetch)
+// =========================================================================
+test('explain: explainTrace calls fetch and returns content', async () => {
+  const savedFetch = global.fetch;
+  const savedKey = process.env.OPENAI_API_KEY;
+  let captured = null;
+  global.fetch = async (url, opts) => {
+    captured = { url, opts };
+    return {
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: '  do batching  ' } }] }),
+    };
+  };
+  const out = await explain.explainTrace(mkTrace(50, [{ name: 'x', start: 0, duration: 50 }]), {
+    apiKey: 'test-key', model: 'm', baseUrl: 'https://example.com/v1/',
+  });
+  assertEqual(out, 'do batching');
+  assert(captured.url === 'https://example.com/v1/chat/completions');
+  assert(captured.opts.headers.Authorization === 'Bearer test-key');
+  global.fetch = savedFetch;
+  if (savedKey) process.env.OPENAI_API_KEY = savedKey;
+});
+
+test('explain: explainTrace throws on non-ok response', async () => {
+  const savedFetch = global.fetch;
+  global.fetch = async () => ({ ok: false, status: 500, text: async () => 'boom' });
+  let threw = false;
+  try {
+    await explain.explainTrace(mkTrace(10, []), { apiKey: 'k' });
+  } catch (err) {
+    threw = true;
+    assert(err.message.includes('HTTP 500'));
+  }
+  global.fetch = savedFetch;
+  assert(threw);
+});
+
+test('explain: prompt includes errors and gaps when present', () => {
+  const trace = {
+    method: 'GET', path: '/g', startTime: 0, duration: 200, status: 500,
+    steps: [{ name: 'fail', start: 0, duration: 10, error: 'nope' }],
+  };
+  const { user } = explain.buildExplainPrompt(trace);
+  assert(user.includes('errored'));
+  assert(user.includes('untraced gap'));
+});
+
+// =========================================================================
+// auto-instrument.js — mocked driver patching
+// =========================================================================
+test('auto-instrument: enableAutoInstrumentation honors only filter', () => {
+  const applied = autoInstrument.enableAutoInstrumentation({ only: ['knex'] });
+  assert(Array.isArray(applied));
+  assert(applied.every(n => n === 'knex'));
+  autoInstrument.disableAutoInstrumentation();
+});
+
+test('auto-instrument: knex instance without .on is returned untouched', () => {
+  const fake = {};
+  assertEqual(autoInstrument.instrumentKnexInstance(fake), fake);
+});
+
+test('auto-instrument: prisma middleware records errors', async () => {
+  let registered = null;
+  autoInstrument.instrumentPrismaClient({ $use(fn) { registered = fn; } });
+  const trace = { steps: [] };
+  let threw = false;
+  await rwtAI(trace, async () => {
+    try {
+      await registered({ model: 'User', action: 'create' }, async () => { throw new Error('dup'); });
+    } catch (_) { threw = true; }
+  });
+  assert(threw);
+  assertEqual(trace.steps[0].error, 'dup');
+});
+
+test('auto-instrument: disable is idempotent', () => {
+  autoInstrument.disableAutoInstrumentation();
+  autoInstrument.disableAutoInstrumentation();
+  assert(true);
+});
+
+test('auto-instrument: pg query is timed (promise + callback)', async () => {
+  class Client { query() { return Promise.resolve({ rows: [] }); } }
+  autoInstrument.__setRequireForTests((name) => (name === 'pg' ? { Client } : null));
+  const applied = autoInstrument.enableAutoInstrumentation({ only: ['pg'] });
+  assertEqual(applied[0], 'pg');
+  const trace = { steps: [] };
+  await rwtAI(trace, async () => {
+    const c = new Client();
+    await c.query('SELECT * FROM users WHERE id = 1');
+    await c.query({ text: 'SELECT 2' });
+  });
+  assertEqual(trace.steps.length, 2);
+  assert(trace.steps[0].name.startsWith('pg '));
+  autoInstrument.disableAutoInstrumentation();
+  autoInstrument.__setRequireForTests(null);
+});
+
+test('auto-instrument: pg callback style records step', () => {
+  class Client { query(sql, cb) { cb(null, { rows: [] }); } }
+  autoInstrument.__setRequireForTests((name) => (name === 'pg' ? { Client } : null));
+  autoInstrument.enableAutoInstrumentation({ only: ['pg'] });
+  const trace = { steps: [] };
+  rwtAI(trace, () => {
+    const c = new Client();
+    c.query('SELECT 1', () => {});
+  });
+  assertEqual(trace.steps.length, 1);
+  autoInstrument.disableAutoInstrumentation();
+  autoInstrument.__setRequireForTests(null);
+});
+
+test('auto-instrument: mongodb collection methods are timed', async () => {
+  class Collection {
+    constructor() { this.collectionName = 'users'; }
+    find() { return { toArray: () => Promise.resolve([]) }; }
+    findOne() { return Promise.resolve(null); }
+    insertOne() { return Promise.resolve({}); }
+    insertMany() { return Promise.resolve({}); }
+    updateOne() { return Promise.resolve({}); }
+    updateMany() { return Promise.resolve({}); }
+    deleteOne() { return Promise.resolve({}); }
+    deleteMany() { return Promise.resolve({}); }
+    aggregate() { return { toArray: () => Promise.resolve([]) }; }
+    countDocuments() { return Promise.resolve(0); }
+  }
+  autoInstrument.__setRequireForTests((name) => (name === 'mongodb' ? { Collection } : null));
+  const applied = autoInstrument.enableAutoInstrumentation({ only: ['mongodb'] });
+  assertEqual(applied[0], 'mongodb');
+  const trace = { steps: [] };
+  await rwtAI(trace, async () => {
+    const col = new Collection();
+    col.find({});            // cursor (sync timed)
+    await col.findOne({});   // promise timed
+    await col.insertOne({});
+  });
+  assert(trace.steps.length >= 3);
+  assert(trace.steps.some(s => s.name.includes('mongo users.find')));
+  autoInstrument.disableAutoInstrumentation();
+  autoInstrument.__setRequireForTests(null);
+});
+
+test('auto-instrument: ioredis sendCommand is timed', async () => {
+  class Redis { sendCommand() { return Promise.resolve('OK'); } }
+  autoInstrument.__setRequireForTests((name) => (name === 'ioredis' ? Redis : null));
+  const applied = autoInstrument.enableAutoInstrumentation({ only: ['redis'] });
+  assertEqual(applied[0], 'redis');
+  const trace = { steps: [] };
+  await rwtAI(trace, async () => {
+    const r = new Redis();
+    await r.sendCommand({ name: 'get' });
+  });
+  assertEqual(trace.steps.length, 1);
+  assert(trace.steps[0].name === 'redis GET');
+  autoInstrument.disableAutoInstrumentation();
+  autoInstrument.__setRequireForTests(null);
+});
+
+test('auto-instrument: recordStep is a no-op without active trace', () => {
+  class Client { query() { return Promise.resolve({}); } }
+  autoInstrument.__setRequireForTests((name) => (name === 'pg' ? { Client } : null));
+  autoInstrument.enableAutoInstrumentation({ only: ['pg'] });
+  // No runWithTrace wrapper -> no active trace -> should not throw
+  const c = new Client();
+  c.query('SELECT 1');
+  assert(true);
+  autoInstrument.disableAutoInstrumentation();
+  autoInstrument.__setRequireForTests(null);
+});
+
 // Run all tests
 run();

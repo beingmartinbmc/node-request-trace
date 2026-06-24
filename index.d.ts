@@ -36,6 +36,7 @@ declare namespace requestTrace {
     retentionSeconds?: number;
     autoTrack?: boolean;
     traceOutgoing?: boolean;
+    autoInstrument?: boolean | { only?: string[] };
     logBody?: boolean;
     sensitiveHeaders?: string[] | null;
   }
@@ -43,6 +44,84 @@ declare namespace requestTrace {
   interface TimelineReport {
     steps: TraceStep[];
     summary: Record<string, unknown>;
+  }
+
+  interface RepetitionEntry {
+    pattern: string;
+    sample: string;
+    type: string | null;
+    count: number;
+    totalDuration: number;
+    maxDuration: number;
+    avgDuration: number;
+    errorCount: number;
+    isNPlusOne: boolean;
+  }
+
+  interface RepetitionAnalysis {
+    duplicates: RepetitionEntry[];
+    nPlusOne: RepetitionEntry[];
+    hasNPlusOne: boolean;
+    duplicateCount: number;
+    wastedDuration: number;
+  }
+
+  interface DiffStep {
+    name: string;
+    status: 'added' | 'removed' | 'slower' | 'faster' | 'unchanged';
+    durationA: number;
+    durationB: number;
+    deltaMs: number;
+    deltaPercent: number | null;
+    countA: number;
+    countB: number;
+  }
+
+  interface TraceDiff {
+    a: Record<string, unknown>;
+    b: Record<string, unknown>;
+    totalDeltaMs: number;
+    totalDeltaPercent: number | null;
+    regressed: boolean;
+    added: DiffStep[];
+    removed: DiffStep[];
+    slower: DiffStep[];
+    faster: DiffStep[];
+    steps: DiffStep[];
+  }
+
+  interface DiffOptions {
+    regressionPercent?: number;
+  }
+
+  interface ExplainPrompt {
+    system: string;
+    user: string;
+    report: TimelineReport;
+  }
+
+  interface ExplainOptions {
+    apiKey?: string;
+    baseUrl?: string;
+    model?: string;
+    temperature?: number;
+  }
+
+  interface MarkdownOptions {
+    slowThreshold?: number;
+  }
+
+  interface SpeedscopeProfile {
+    $schema: string;
+    name: string;
+    activeProfileIndex: number;
+    exporter: string;
+    shared: { frames: Array<{ name: string }> };
+    profiles: unknown[];
+  }
+
+  interface AutoInstrumentOptions {
+    only?: string[];
   }
 
   interface LoggerIntegration {
@@ -67,6 +146,19 @@ declare namespace requestTrace {
     isHttpTracingEnabled(): boolean;
     exportChromeTrace(trace: Trace): unknown[];
     exportChromeTraceJson(trace: Trace): string;
+    exportSpeedscope(trace?: Trace | null): SpeedscopeProfile;
+    exportSpeedscopeJson(trace?: Trace | null): string;
+    toShareableHtml(trace?: Trace | null): string;
+    toMarkdown(trace?: Trace | null, options?: MarkdownOptions): string;
+    diff(traceA: Trace, traceB: Trace, options?: DiffOptions): TraceDiff;
+    diffToMarkdown(traceA: Trace, traceB: Trace, options?: DiffOptions): string;
+    analyze(trace?: Trace | null): RepetitionAnalysis;
+    buildExplainPrompt(trace?: Trace | null): ExplainPrompt;
+    explain(trace?: Trace | null, options?: ExplainOptions): Promise<string>;
+    enableAutoInstrumentation(options?: AutoInstrumentOptions): string[];
+    disableAutoInstrumentation(): this;
+    instrumentKnex(knexInstance: any): any;
+    instrumentPrisma(prismaClient: any): any;
     timeline(trace?: Trace | null): TimelineReport;
     renderTimeline(trace?: Trace | null, options?: { width?: number }): string;
     sanitizeHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string | string[] | undefined>;

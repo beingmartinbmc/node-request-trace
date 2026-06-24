@@ -11,6 +11,18 @@ const { createPinoIntegration, createWinstonIntegration, createConsoleIntegratio
 const { sanitizeHeaders } = require('./lib/security');
 const { enableHttpTracing, disableHttpTracing, isEnabled: isHttpTracingEnabled } = require('./lib/http-tracer');
 const { toChromeTraceFormat, toChromeTraceJson } = require('./lib/chrome-trace');
+const { toSpeedscope, toSpeedscopeJson } = require('./lib/speedscope');
+const { toShareableHtml } = require('./lib/snapshot');
+const { toMarkdown } = require('./lib/markdown');
+const { diffTraces, diffToMarkdown } = require('./lib/diff');
+const { buildExplainPrompt, explainTrace } = require('./lib/explain');
+const { analyzeRepetition } = require('./lib/analysis');
+const {
+  enableAutoInstrumentation,
+  disableAutoInstrumentation,
+  instrumentKnexInstance,
+  instrumentPrismaClient,
+} = require('./lib/auto-instrument');
 const { buildTimeline, renderTimeline: renderTimelineReport } = require('./lib/timeline');
 
 const DEFAULT_CONFIG = {
@@ -20,6 +32,7 @@ const DEFAULT_CONFIG = {
   retentionSeconds: 300,
   autoTrack: false,
   traceOutgoing: false,
+  autoInstrument: false,
   logBody: false,
   sensitiveHeaders: null,
 };
@@ -43,6 +56,12 @@ class RequestTracer {
 
     if (this.config.traceOutgoing) {
       enableHttpTracing();
+    }
+
+    if (this.config.autoInstrument) {
+      this._autoInstrumented = enableAutoInstrumentation(
+        typeof this.config.autoInstrument === 'object' ? this.config.autoInstrument : {}
+      );
     }
 
     return this;
@@ -137,6 +156,62 @@ class RequestTracer {
     return toChromeTraceJson(trace);
   }
 
+  exportSpeedscope(trace = this.current()) {
+    return toSpeedscope(trace);
+  }
+
+  exportSpeedscopeJson(trace = this.current()) {
+    return toSpeedscopeJson(trace);
+  }
+
+  toShareableHtml(trace = this.current()) {
+    return toShareableHtml(trace);
+  }
+
+  toMarkdown(trace = this.current(), options) {
+    return toMarkdown(trace, { slowThreshold: this.config.slowThreshold, ...options });
+  }
+
+  diff(traceA, traceB, options) {
+    return diffTraces(traceA, traceB, options);
+  }
+
+  diffToMarkdown(traceA, traceB, options) {
+    return diffToMarkdown(diffTraces(traceA, traceB, options));
+  }
+
+  analyze(trace = this.current()) {
+    const t = trace || {};
+    return analyzeRepetition(t.steps);
+  }
+
+  buildExplainPrompt(trace = this.current()) {
+    return buildExplainPrompt(trace);
+  }
+
+  explain(trace = this.current(), options) {
+    return explainTrace(trace, options);
+  }
+
+  enableAutoInstrumentation(options) {
+    this._autoInstrumented = enableAutoInstrumentation(options);
+    return this._autoInstrumented;
+  }
+
+  disableAutoInstrumentation() {
+    disableAutoInstrumentation();
+    this._autoInstrumented = [];
+    return this;
+  }
+
+  instrumentKnex(knexInstance) {
+    return instrumentKnexInstance(knexInstance);
+  }
+
+  instrumentPrisma(prismaClient) {
+    return instrumentPrismaClient(prismaClient);
+  }
+
   timeline(trace = this.current()) {
     return buildTimeline(trace);
   }
@@ -155,6 +230,8 @@ class RequestTracer {
       this.storage.clear();
     }
     disableHttpTracing();
+    disableAutoInstrumentation();
+    this._autoInstrumented = [];
     this._initialized = false;
   }
 
