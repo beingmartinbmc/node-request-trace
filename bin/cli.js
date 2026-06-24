@@ -31,7 +31,12 @@ ${BOLD}Commands:${RESET}
   ${GREEN}inspect${RESET}  <url> <id>     Show single trace detail
   ${GREEN}timeline${RESET} <url> <id>     Show request timeline report
   ${GREEN}tail${RESET}     <url>          Live tail of incoming traces
+  ${GREEN}diff${RESET}     <url> <a> <b>  Compare two traces (regression diff)
+  ${GREEN}markdown${RESET} <url> <id>     Print GitHub-flavored markdown (alias: md)
+  ${GREEN}snapshot${RESET} <url> <id>     Save a self-contained shareable .html file
+  ${GREEN}explain${RESET}  <url> <id>     AI explanation of why a request was slow
   ${GREEN}export${RESET}   <url> <id>     Export trace as Chrome Trace JSON
+  ${GREEN}speedscope${RESET} <url> <id>   Export trace as Speedscope JSON
 
 ${BOLD}Examples:${RESET}
   npx node-request-trace stats http://localhost:3000
@@ -39,7 +44,12 @@ ${BOLD}Examples:${RESET}
   npx node-request-trace inspect http://localhost:3000 req_abc123
   npx node-request-trace timeline http://localhost:3000 req_abc123
   npx node-request-trace tail http://localhost:3000
+  npx node-request-trace diff http://localhost:3000 req_aaa req_bbb
+  npx node-request-trace markdown http://localhost:3000 req_abc123
+  npx node-request-trace snapshot http://localhost:3000 req_abc123 > trace.html
+  npx node-request-trace explain http://localhost:3000 req_abc123
   npx node-request-trace export http://localhost:3000 req_abc123 > trace.json
+  npx node-request-trace speedscope http://localhost:3000 req_abc > scope.json
 `;
 
 function fetchJson(url) {
@@ -54,6 +64,22 @@ function fetchJson(url) {
         }
         try { resolve(JSON.parse(data)); }
         catch (e) { reject(new Error('Invalid JSON response')); }
+      });
+    }).on('error', reject);
+  });
+}
+
+function fetchText(url) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 400) {
+          return reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+        }
+        resolve(data);
       });
     }).on('error', reject);
   });
@@ -268,6 +294,104 @@ async function cmdExport(baseUrl, requestId) {
   console.log(JSON.stringify(chromeTrace, null, 2));
 }
 
+async function cmdSpeedscope(baseUrl, requestId) {
+  if (!requestId) {
+    console.error(`${RED}Error: request ID required${RESET}`);
+    console.error('Usage: npx node-request-trace speedscope <url> <request-id>');
+    process.exit(1);
+  }
+  const profile = await fetchJson(`${baseUrl}/trace/${requestId}/speedscope`);
+  console.log(JSON.stringify(profile, null, 2));
+}
+
+async function cmdMarkdown(baseUrl, requestId) {
+  if (!requestId) {
+    console.error(`${RED}Error: request ID required${RESET}`);
+    console.error('Usage: npx node-request-trace markdown <url> <request-id>');
+    process.exit(1);
+  }
+  const md = await fetchText(`${baseUrl}/trace/${requestId}/markdown`);
+  console.log(md);
+}
+
+async function cmdSnapshot(baseUrl, requestId) {
+  if (!requestId) {
+    console.error(`${RED}Error: request ID required${RESET}`);
+    console.error('Usage: npx node-request-trace snapshot <url> <request-id> > trace.html');
+    process.exit(1);
+  }
+  const html = await fetchText(`${baseUrl}/trace/${requestId}/snapshot`);
+  // If stdout is a TTY, write a file; otherwise stream for redirection.
+  if (process.stdout.isTTY) {
+    const fs = require('node:fs');
+    const file = `${requestId}.html`;
+    fs.writeFileSync(file, html);
+    console.log(`\n  ${GREEN}Saved${RESET} ${file} ${DIM}(open in a browser, or share the file)${RESET}\n`);
+  } else {
+    process.stdout.write(html);
+  }
+}
+
+async function cmdDiff(baseUrl, idA, idB) {
+  if (!idA || !idB) {
+    console.error(`${RED}Error: two request IDs required${RESET}`);
+    console.error('Usage: npx node-request-trace diff <url> <id-a> <id-b>');
+    process.exit(1);
+  }
+  const diff = await fetchJson(`${baseUrl}/trace/diff/${idA}/${idB}`);
+  printDiff(diff);
+}
+
+async function cmdExplain(baseUrl, requestId) {
+  if (!requestId) {
+    console.error(`${RED}Error: request ID required${RESET}`);
+    console.error('Usage: npx node-request-trace explain <url> <request-id>');
+    process.exit(1);
+  }
+  const { buildExplainPrompt, explainTrace } = require('../lib/explain');
+  const trace = await fetchJson(`${baseUrl}/trace/${requestId}`);
+
+  if (!process.env.OPENAI_API_KEY && !process.env.LLM_API_KEY) {
+    const { system, user } = buildExplainPrompt(trace);
+    console.log(`\n${YELLOW}No API key set (OPENAI_API_KEY / LLM_API_KEY).${RESET}`);
+    console.log(`${DIM}Copy the prompt below into your LLM of choice:${RESET}\n`);
+    console.log(`${DIM}--- system ---${RESET}\n${system}\n`);
+    console.log(`${DIM}--- user ---${RESET}\n${user}\n`);
+    return;
+  }
+
+  console.log(`\n${DIM}  Asking the model...${RESET}\n`);
+  const answer = await explainTrace(trace);
+  console.log(answer + '\n');
+}
+
+function printDiff(diff) {
+  const arrow = diff.totalDeltaMs > 0 ? `${RED}🔺${RESET}` : diff.totalDeltaMs < 0 ? `${GREEN}🔻${RESET}` : '➖';
+  console.log(`\n${BOLD}  Trace diff: ${diff.b.method} ${diff.b.path}${RESET}\n`);
+  const pct = diff.totalDeltaPercent === null ? 'n/a' : `${diff.totalDeltaPercent}%`;
+  const sign = diff.totalDeltaMs > 0 ? '+' : '';
+  console.log(
+    `  ${arrow} Total: ${diff.a.totalDuration}ms → ${diff.b.totalDuration}ms ` +
+    `(${sign}${diff.totalDeltaMs}ms, ${pct})` +
+    (diff.regressed ? ` ${RED}⚠ regression${RESET}` : '')
+  );
+  console.log();
+  for (const s of diff.steps) {
+    if (s.status === 'unchanged') continue;
+    let label;
+    if (s.status === 'added') label = `${BLUE}added${RESET}`;
+    else if (s.status === 'removed') label = `${GRAY}removed${RESET}`;
+    else if (s.status === 'slower') label = `${RED}slower${RESET}`;
+    else label = `${GREEN}faster${RESET}`;
+    const sgn = s.deltaMs > 0 ? '+' : '';
+    console.log(
+      `  ${padRight(s.name, 28)} ${padLeft(s.durationA + 'ms', 8)} → ` +
+      `${padLeft(s.durationB + 'ms', 8)}  ${padLeft(sgn + s.deltaMs + 'ms', 9)}  ${label}`
+    );
+  }
+  console.log();
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
@@ -294,7 +418,13 @@ async function main() {
       case 'inspect': return await cmdInspect(cleanUrl, args[2]);
       case 'timeline': return await cmdTimeline(cleanUrl, args[2]);
       case 'tail':    return await cmdTail(cleanUrl);
+      case 'diff':    return await cmdDiff(cleanUrl, args[2], args[3]);
+      case 'markdown':
+      case 'md':      return await cmdMarkdown(cleanUrl, args[2]);
+      case 'snapshot': return await cmdSnapshot(cleanUrl, args[2]);
+      case 'explain': return await cmdExplain(cleanUrl, args[2]);
       case 'export':  return await cmdExport(cleanUrl, args[2]);
+      case 'speedscope': return await cmdSpeedscope(cleanUrl, args[2]);
       default:
         console.error(`${RED}Unknown command: ${command}${RESET}`);
         console.log(USAGE);

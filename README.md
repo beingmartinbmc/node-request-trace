@@ -6,6 +6,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](./LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](./package.json)
 
+<p align="center">
+  <img src="./assets/node-request-trace-readme-hero.png" alt="node-request-trace request timeline hero" width="100%">
+</p>
+
 Debug any Node.js request like a timeline.
 
 `node-request-trace` shows what happened inside a request, where the time went, and which step caused the slowdown, without asking you to adopt OpenTelemetry, run a collector, or wire up a tracing backend.
@@ -28,7 +32,7 @@ OpenTelemetry is powerful, standard, and absolutely worth using for large produc
 
 > Why was this request slow?
 
-`node-request-trace` is for that moment. Add middleware, wrap important work in `trace.step()`, and immediately get request timelines, bottleneck detection, outgoing HTTP tracing, a browser dashboard, Chrome trace export, and terminal-friendly reports.
+`node-request-trace` is for that moment. Add middleware, wrap important work in `trace.step()`, and immediately get request timelines, bottleneck detection, N+1 detection, outgoing HTTP tracing, a browser dashboard, and exports for terminal reports, Markdown, Chrome tracing, and Speedscope.
 
 ## The Pitch
 
@@ -70,13 +74,17 @@ npx node-request-trace timeline http://localhost:3000 req_a1b2c3d4e5f6
 ## What You Get
 
 - Request timelines with bottleneck, traced coverage, and uninstrumented gap detection.
+- N+1 and duplicate-work detection within a single request.
 - Async context propagation through `AsyncLocalStorage`.
 - Manual `trace.step()` spans for database calls, service calls, queues, cache reads, and any async work.
 - Automatic Express, Fastify, and Koa middleware/lifecycle timing.
+- Automatic database and cache instrumentation for `pg`, `mongodb`, `ioredis`, `knex`, and Prisma.
 - Outgoing `http`, `https`, and `fetch` tracing.
-- Built-in dashboard at `/trace/ui`.
-- CLI for stats, recent traces, slow traces, timeline reports, tailing, and exports.
-- Chrome Trace Event export for `chrome://tracing`.
+- Built-in dashboard at `/trace/ui` with waterfall, timeline, and flamegraph views.
+- CLI for stats, recent traces, slow traces, timeline reports, tailing, diffing, and exports.
+- Trace diffing to catch regressions between two requests.
+- Optional AI explanations of why a request was slow.
+- Exports for Markdown, a self-contained shareable HTML snapshot, Chrome Trace Event Format, and Speedscope.
 - Sampling, slow request detection, retention limits, and in-memory eviction.
 - Header redaction by default and no request body capture.
 - Zero runtime dependencies.
@@ -123,7 +131,7 @@ Runnable example: [`node-actuator-lite/examples/ecosystem`](https://github.com/b
 npm install node-request-trace
 ```
 
-The package supports Node.js 16 and newer. It has optional peer support for Express, Fastify, and Koa, but no runtime dependencies of its own.
+The package supports Node.js 16 and newer. It has optional peer support for Express, Fastify, and Koa, but no runtime dependencies of its own. AI explanations and `fetch` tracing use the global `fetch`, which is available on Node.js 18 and newer.
 
 ## Quick Start
 
@@ -211,6 +219,7 @@ Structured reports include:
 - `summary.uninstrumentedDuration`: request time not explained by recorded steps.
 - `summary.coveragePercent`: how much of the request timeline is explained.
 - `summary.gaps`: idle or uninstrumented windows between steps.
+- `summary.duplicates`: repeated steps, including detected N+1 patterns.
 - `summary.errorCount`: number of failed steps.
 
 This makes it easy to answer:
@@ -218,6 +227,7 @@ This makes it easy to answer:
 - Did the database cause the slowdown?
 - Did middleware run before the handler?
 - How much of the request is still a blind spot?
+- Am I making the same query in a loop?
 - Which step should I optimize first?
 
 ## Manual Instrumentation
@@ -244,6 +254,42 @@ trace.init({ autoTrack: true });
 
 Express records middleware layers. Fastify records lifecycle phases such as `onRequest`, `preParsing`, `preValidation`, `handler`, and `onSend`. Koa wraps `app.use()` middleware after `trace.instrumentKoa(app)`.
 
+### Database and Cache Clients
+
+Enable `autoInstrument` to time queries from common drivers without wrapping each call in `trace.step()`.
+
+```js
+trace.init({ autoInstrument: true });
+```
+
+This patches `pg` (node-postgres), `mongodb`, and `ioredis` when they are present. Queries appear as `db` and `cache` steps with truncated, redaction-friendly labels:
+
+```txt
+pg SELECT * FROM users WHERE id = ?   12ms [db]
+mongo users.findOne                    8ms [db]
+redis GET                              1ms [cache]
+```
+
+Limit which drivers are patched with the `only` list:
+
+```js
+trace.init({ autoInstrument: { only: ["pg", "mongodb"] } });
+```
+
+`knex` and Prisma are instance-based, so instrument them explicitly:
+
+```js
+trace.instrumentKnex(knex);
+trace.instrumentPrisma(prisma);
+```
+
+You can also toggle driver instrumentation at runtime:
+
+```js
+trace.enableAutoInstrumentation({ only: ["pg"] });
+trace.disableAutoInstrumentation();
+```
+
 ### Outgoing HTTP
 
 Enable outgoing HTTP tracing to automatically capture calls made with Node's `http`, `https`, and global `fetch`.
@@ -266,6 +312,79 @@ HTTP POST api.stripe.com/v1/charges 180ms [http-outgoing]
 HTTP GET cdn.example.com/assets      45ms [http-outgoing]
 ```
 
+## N+1 and Duplicate Detection
+
+`node-request-trace` groups semantically identical steps within a request so repeated work stands out. Numbers, ids, UUIDs, and quoted literals are normalized, so `SELECT ... WHERE id = 1` and `SELECT ... WHERE id = 2` count as the same pattern.
+
+```js
+const analysis = trace.analyze(savedTrace);
+
+if (analysis.hasNPlusOne) {
+  console.log(analysis.nPlusOne);
+}
+```
+
+The analysis reports each repeated pattern with its count, total and average duration, whether it reads as an N+1 pattern, and how much time was wasted on repetition. Detected patterns also surface in timeline reports, the dashboard, Markdown exports, and AI explanations.
+
+## Trace Diffing
+
+Compare two traces to find what changed between a fast request and a slow one, or before and after a deploy.
+
+```js
+const diff = trace.diff(traceA, traceB);
+
+console.log(diff.totalDeltaMs, diff.regressed);
+console.log(trace.diffToMarkdown(traceA, traceB));
+```
+
+Each step is labeled `added`, `removed`, `slower`, `faster`, or `unchanged`, with per-step deltas and an overall regression flag. From the CLI:
+
+```bash
+npx node-request-trace diff http://localhost:3000 req_aaa req_bbb
+```
+
+## AI Explanations
+
+Turn a trace into a focused, actionable explanation of why it was slow.
+
+```js
+const text = await trace.explain(savedTrace, {
+  apiKey: process.env.OPENAI_API_KEY,
+});
+```
+
+The explanation uses any OpenAI-compatible chat completions endpoint. You supply the key, model, and base URL, so no vendor is bundled and no secrets are stored. Set `OPENAI_API_KEY` or `LLM_API_KEY`, or pass `{ apiKey }` directly.
+
+If you would rather not call a model, build the prompt and paste it into your own chat:
+
+```js
+const { system, user } = trace.buildExplainPrompt(savedTrace);
+```
+
+From the CLI, `explain` calls the model when a key is set, and otherwise prints the prompt for you to copy:
+
+```bash
+OPENAI_API_KEY=sk-... npx node-request-trace explain http://localhost:3000 req_abc123
+```
+
+## Exports
+
+A trace can be exported in several formats for sharing and deeper analysis.
+
+```js
+trace.toMarkdown(savedTrace);          // GitHub-flavored markdown report
+trace.toShareableHtml(savedTrace);     // self-contained single-file HTML
+trace.exportChromeTrace(savedTrace);   // Chrome Trace Event Format object
+trace.exportChromeTraceJson(savedTrace);
+trace.exportSpeedscope(savedTrace);    // Speedscope profile object
+trace.exportSpeedscopeJson(savedTrace);
+```
+
+- **Markdown** is ideal for PR comments, issues, and incident notes.
+- **HTML snapshot** is a single self-contained file you can open in a browser or send to a teammate.
+- **Chrome Trace** loads in `chrome://tracing`.
+- **Speedscope** loads at [speedscope.app](https://www.speedscope.app) for flamegraph analysis.
+
 ## Dashboard
 
 Mount `trace.routes()` and visit `/trace/ui`.
@@ -281,7 +400,8 @@ The dashboard includes:
 - Live feed.
 - Request detail view.
 - Waterfall, timeline, and flamegraph modes.
-- Chrome trace export button.
+- N+1 and duplicate-work warnings.
+- Export buttons for Chrome trace, Speedscope, Markdown, and HTML snapshots.
 
 ## CLI
 
@@ -294,10 +414,15 @@ npx node-request-trace slow http://localhost:3000
 npx node-request-trace inspect http://localhost:3000 req_a1b2c3d4
 npx node-request-trace timeline http://localhost:3000 req_a1b2c3d4
 npx node-request-trace tail http://localhost:3000
+npx node-request-trace diff http://localhost:3000 req_aaa req_bbb
+npx node-request-trace markdown http://localhost:3000 req_a1b2c3d4
+npx node-request-trace snapshot http://localhost:3000 req_a1b2c3d4 > trace.html
+npx node-request-trace explain http://localhost:3000 req_a1b2c3d4
 npx node-request-trace export http://localhost:3000 req_a1b2c3d4 > trace.json
+npx node-request-trace speedscope http://localhost:3000 req_a1b2c3d4 > scope.json
 ```
 
-Use `timeline` when you want the fastest answer. Use `inspect` when you want the fuller detail view. Use `export` when you want to load the trace in `chrome://tracing`.
+Use `timeline` when you want the fastest answer. Use `inspect` when you want the fuller detail view. Use `diff` to catch regressions, `explain` for an AI summary, and `export`, `speedscope`, `markdown`, or `snapshot` to take a trace elsewhere. `markdown` is also available as `md`.
 
 ## HTTP API
 
@@ -310,6 +435,10 @@ Use `timeline` when you want the fastest answer. Use `inspect` when you want the
 | `GET /trace/:requestId` | Raw trace JSON |
 | `GET /trace/:requestId/timeline` | Timeline report plus ASCII rendering |
 | `GET /trace/:requestId/chrome` | Chrome Trace Event JSON |
+| `GET /trace/:requestId/speedscope` | Speedscope profile JSON |
+| `GET /trace/:requestId/markdown` | GitHub-flavored Markdown report |
+| `GET /trace/:requestId/snapshot` | Self-contained shareable HTML download |
+| `GET /trace/diff/:idA/:idB` | Diff between two traces |
 
 Example timeline response:
 
@@ -345,6 +474,7 @@ trace.init({
   retentionSeconds: 300,
   autoTrack: false,
   traceOutgoing: false,
+  autoInstrument: false,
   sensitiveHeaders: null,
 });
 ```
@@ -385,6 +515,42 @@ Builds a structured timeline report.
 
 Builds an ASCII request timeline. Use `options.width` to control the chart width.
 
+### `trace.analyze(trace)`
+
+Returns N+1 and duplicate-work analysis for a trace's steps.
+
+### `trace.diff(traceA, traceB, options)`
+
+Compares two traces and returns a per-step diff with an overall regression flag.
+
+### `trace.diffToMarkdown(traceA, traceB, options)`
+
+Returns the diff as GitHub-flavored Markdown.
+
+### `trace.explain(trace, options)`
+
+Calls an OpenAI-compatible endpoint and returns a short explanation of why the request was slow. Accepts `{ apiKey, model, baseUrl }`.
+
+### `trace.buildExplainPrompt(trace)`
+
+Returns `{ system, user }` prompt text so you can run the explanation in any chat tool without a key.
+
+### `trace.enableAutoInstrumentation(options)`
+
+Patches supported drivers (`pg`, `mongodb`, `ioredis`) and returns the list that was applied. Accepts `{ only: [...] }`.
+
+### `trace.disableAutoInstrumentation()`
+
+Restores the original driver methods.
+
+### `trace.instrumentKnex(knexInstance)`
+
+Attaches query timing to a `knex` instance via its event hooks.
+
+### `trace.instrumentPrisma(prismaClient)`
+
+Adds query timing through Prisma's `$use` middleware.
+
 ### `trace.useLogger(type, logger)`
 
 Supports `"console"`, `"pino"`, `"winston"`, or a custom `{ onTrace(trace) {} }` integration.
@@ -397,13 +563,21 @@ Patches outgoing `http`, `https`, and `fetch` calls.
 
 Restores the original outgoing HTTP functions.
 
-### `trace.exportChromeTrace(trace)`
+### `trace.exportChromeTrace(trace)` / `trace.exportChromeTraceJson(trace)`
 
-Returns Chrome Trace Event Format data.
+Returns Chrome Trace Event Format data, as an object or a JSON string.
 
-### `trace.exportChromeTraceJson(trace)`
+### `trace.exportSpeedscope(trace)` / `trace.exportSpeedscopeJson(trace)`
 
-Returns Chrome Trace Event Format as a JSON string.
+Returns a Speedscope profile, as an object or a JSON string.
+
+### `trace.toMarkdown(trace, options)`
+
+Returns a GitHub-flavored Markdown report for a trace.
+
+### `trace.toShareableHtml(trace)`
+
+Returns a self-contained HTML document for the trace.
 
 ### `trace.sanitizeHeaders(headers)`
 
@@ -411,7 +585,7 @@ Redacts sensitive headers using the configured list.
 
 ### `trace.destroy()`
 
-Stops cleanup timers, clears stored traces, disables HTTP tracing, and resets the tracer.
+Stops cleanup timers, clears stored traces, disables HTTP tracing and auto-instrumentation, and resets the tracer.
 
 ## Configuration
 
@@ -422,6 +596,7 @@ Stops cleanup timers, clears stored traces, disables HTTP tracing, and resets th
 | `maxTraces` | `1000` | Maximum number of traces stored in memory |
 | `retentionSeconds` | `300` | How long traces stay in memory |
 | `autoTrack` | `false` | Enables framework middleware/lifecycle timing |
+| `autoInstrument` | `false` | Enables driver instrumentation; pass `{ only: [...] }` to limit it |
 | `traceOutgoing` | `false` | Enables outgoing HTTP and fetch tracing |
 | `sensitiveHeaders` | `null` | Custom sensitive header list |
 
@@ -433,6 +608,7 @@ In development, run with full sampling and rich instrumentation:
 trace.init({
   samplingRate: 1,
   autoTrack: true,
+  autoInstrument: true,
   traceOutgoing: true,
 });
 ```
@@ -456,6 +632,7 @@ This library stores traces in memory. It is intentionally lightweight and local-
 
 - Request and response bodies are not captured.
 - Sensitive headers are redacted.
+- Auto-instrumented query labels are truncated and strip literal values.
 - The default redaction list includes `Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key`, `X-Auth-Token`, and `Proxy-Authorization`.
 
 Customize header redaction:
@@ -465,6 +642,8 @@ trace.init({
   sensitiveHeaders: ["authorization", "x-internal-secret"],
 });
 ```
+
+AI explanations are opt-in and only send the trace summary you generate. No key is bundled, and requests go directly to the endpoint you configure.
 
 ## Performance
 
